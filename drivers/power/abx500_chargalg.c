@@ -1,5 +1,5 @@
 /*
- * Copyright (C) ST-Ericsson SA 2011
+ * Copyright (C) ST-Ericsson SA 2012
  *
  * Charging algorithm driver for abx500 variants
  *
@@ -7,6 +7,7 @@
  * Authors:
  *	Johan Palsson <johan.palsson@stericsson.com>
  *	Karl Komierowski <karl.komierowski@stericsson.com>
+ *	Arun R Murthy <arun.murthy@stericsson.com>
  */
 
 #include <linux/init.h>
@@ -22,7 +23,7 @@
 #include <linux/kobject.h>
 #include <linux/mfd/abx500.h>
 #include <linux/mfd/abx500/ux500_chargalg.h>
-#include <linux/mfd/abx500/ab5500-bm.h>
+#include <linux/mfd/abx500/ab8500-bm.h>
 
 /* Watchdog kick interval */
 #define CHG_WD_INTERVAL			(6 * HZ)
@@ -219,6 +220,7 @@ enum maxim_ret {
  */
 struct abx500_chargalg {
 	struct device *dev;
+	struct ab8500 *parent;
 	int charge_status;
 	int eoc_cnt;
 	int rch_cnt;
@@ -1705,7 +1707,7 @@ static struct attribute *abx500_chargalg_chg[] = {
 	NULL
 };
 
-const struct sysfs_ops abx500_chargalg_sysfs_ops = {
+static const struct sysfs_ops abx500_chargalg_sysfs_ops = {
 	.store = abx500_chargalg_sysfs_charger,
 };
 
@@ -1801,7 +1803,7 @@ static int __devexit abx500_chargalg_remove(struct platform_device *pdev)
 
 static int __devinit abx500_chargalg_probe(struct platform_device *pdev)
 {
-	struct abx500_bm_plat_data *plat_data;
+	struct ab8500_platform_data *plat_data;
 	int ret = 0;
 
 	struct abx500_chargalg *di =
@@ -1811,8 +1813,8 @@ static int __devinit abx500_chargalg_probe(struct platform_device *pdev)
 
 	/* get device struct */
 	di->dev = &pdev->dev;
-
-	plat_data = pdev->dev.platform_data;
+	di->parent = dev_get_drvdata(pdev->dev.parent);
+	plat_data = dev_get_platdata(di->parent->dev);
 	di->pdata = plat_data->chargalg;
 	di->bat = plat_data->battery;
 

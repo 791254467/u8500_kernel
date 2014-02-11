@@ -33,17 +33,20 @@ static struct map_desc u5500_uart_io_desc[] __initdata = {
 };
 
 static struct map_desc u5500_io_desc[] __initdata = {
-	__IO_DEV_DESC(U5500_GIC_CPU_BASE, SZ_4K),
+	/* SCU base also covers GIC CPU BASE and TWD with its 4K page */
+	__IO_DEV_DESC(U5500_SCU_BASE, SZ_4K),
 	__IO_DEV_DESC(U5500_GIC_DIST_BASE, SZ_4K),
 	__IO_DEV_DESC(U5500_L2CC_BASE, SZ_4K),
-	__IO_DEV_DESC(U5500_TWD_BASE, SZ_4K),
 	__IO_DEV_DESC(U5500_MTU0_BASE, SZ_4K),
 	__IO_DEV_DESC(U5500_MTU1_BASE, SZ_4K),
-	__IO_DEV_DESC(U5500_SCU_BASE, SZ_4K),
 	__IO_DEV_DESC(U5500_RTC_BASE, SZ_4K),
 	__IO_DEV_DESC(U5500_MTIMER_BASE, SZ_4K),
 	__IO_DEV_DESC(U5500_BACKUPRAM0_BASE, SZ_8K),
-	__MEM_DEV_DESC(U5500_BOOT_ROM_BASE, SZ_1M),
+
+	/* Map U5500_PUBLIC_BOOT_ROM_BASE (base+18000) only
+	 * for TEE security driver
+	 * and avoid overlap with asic ID at base+1D000 */
+	__MEM_DEV_DESC(U5500_BOOT_ROM_BASE+0x18000, 6*SZ_4K),
 
 	__IO_DEV_DESC(U5500_GPIO0_BASE, SZ_4K),
 	__IO_DEV_DESC(U5500_GPIO1_BASE, SZ_4K),
@@ -160,6 +163,7 @@ static struct platform_device *db5500_platform_devs[] __initdata = {
 	&mbox1_device,
 	&mbox2_device,
 	&db5500_prcmu_device,
+	&u5500_wdt_device,
 };
 
 static u8 db5500_revision;
@@ -253,19 +257,39 @@ static int usb_db5500_tx_dma_cfg[] = {
 	DB5500_DMA_DEV38_USB_OTG_OEP_8
 };
 
-void __init u5500_init_devices(void)
+static const char *db5500_read_soc_id(void)
 {
-	ux500_init_devices();
+	return kasprintf(GFP_KERNEL, "u5500 currently unsupported\n");
+}
+
+static struct device * __init db5500_soc_device_init(void)
+{
+	const char *soc_id = db5500_read_soc_id();
+
+	return ux500_soc_device_init(soc_id);
+}
+
+struct device * __init u5500_init_devices(void)
+{
+	struct device *parent;
+	int i;
 
 #ifdef CONFIG_STM_TRACE
 	/* Early init for STM tracing */
 	/* platform_device_register(&u5500_stm_device); */
 #endif
+	parent = db5500_soc_device_init();
+
 	db5500_pmu_init();
-	db5500_dma_init();
-	db5500_add_rtc();
-	db5500_add_usb(usb_db5500_rx_dma_cfg, usb_db5500_tx_dma_cfg);
+	db5500_dma_init(parent);
+	db5500_add_rtc(parent);
+	db5500_add_usb(parent, usb_db5500_rx_dma_cfg, usb_db5500_tx_dma_cfg);
+
+	for (i = 0; i < ARRAY_SIZE(db5500_platform_devs); i++)
+		db5500_platform_devs[i]->dev.parent = parent;
 
 	platform_add_devices(db5500_platform_devs,
 			     ARRAY_SIZE(db5500_platform_devs));
+
+	return parent;
 }

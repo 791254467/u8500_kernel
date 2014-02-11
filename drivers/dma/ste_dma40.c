@@ -9,6 +9,7 @@
 #include <linux/dma-mapping.h>
 #include <linux/kernel.h>
 #include <linux/slab.h>
+#include <linux/export.h>
 #include <linux/dmaengine.h>
 #include <linux/platform_device.h>
 #include <linux/clk.h>
@@ -17,17 +18,12 @@
 #include <linux/pm_runtime.h>
 #include <linux/err.h>
 #include <linux/amba/bus.h>
+#include <linux/regulator/consumer.h>
 
 #include <plat/ste_dma40.h>
 
+#include "dmaengine.h"
 #include "ste_dma40_ll.h"
-
-#ifdef CONFIG_STE_DMA40_DEBUG
-#include "ste_dma40_debug.h"
-#define MARK sted40_history_text((char *)__func__)
-#else
-#define MARK
-#endif
 
 #define D40_NAME "dma40"
 
@@ -164,10 +160,9 @@ struct d40_lli_pool {
  * points into the lli_pool, to base if lli_len > 1 or to pre_alloc_lli if
  * lli_len equals one.
  * @lli_log: Same as above but for logical channels.
- * @last_lcla: lcla used for last link (logical channels)
  * @lli_pool: The pool with two entries pre-allocated.
  * @lli_len: Number of llis of current descriptor.
- * @lli_current: Number of transfered llis.
+ * @lli_current: Number of transferred llis.
  * @lcla_alloc: Number of LCLA entries allocated.
  * @txd: DMA engine struct. Used for among other things for communication
  * during a transfer.
@@ -182,7 +177,6 @@ struct d40_desc {
 	struct d40_phy_lli_bidir	 lli_phy;
 	/* LLI logical */
 	struct d40_log_lli_bidir	 lli_log;
-	struct d40_log_lli		*last_lcla;
 
 	struct d40_lli_pool		 lli_pool;
 	int				 lli_len;
@@ -228,7 +222,6 @@ struct d40_lcla_pool {
  * @allocated_dst: Same as for src but is dst.
  * allocated_dst and allocated_src uses the D40_ALLOC* defines as well as
  * event line number.
- * @use_soft_lli: To mark if the linked lists of channel are managed by SW.
  */
 struct d40_phy_res {
 	spinlock_t lock;
@@ -236,7 +229,6 @@ struct d40_phy_res {
 	int	   num;
 	u32	   allocated_src;
 	u32	   allocated_dst;
-	bool	   use_soft_lli;
 };
 
 struct d40_base;
@@ -246,8 +238,6 @@ struct d40_base;
  *
  * @lock: A spinlock to protect this struct.
  * @log_num: The logical number, if any of this channel.
- * @completed: Starts with 1, after first interrupt it is set to dma engine's
- * current cookie.
  * @pending_tx: The number of pending transfers. Used between interrupt handler
  * and tasklet.
  * @busy: Set to true when transfer is ongoing on this channel.
@@ -259,7 +249,6 @@ struct d40_base;
  * @client: Cliented owned descriptor list.
  * @pending_queue: Submitted jobs, to be issued by issue_pending()
  * @active: Active descriptor.
- * @done: Completed jobs
  * @queue: Queued jobs.
  * @prepare_queue: Prepared jobs.
  * @dma_cfg: The client configuration of this dma channel.
@@ -271,16 +260,12 @@ struct d40_base;
  * @lcpa: Pointer to dst and src lcpa settings.
  * @runtime_addr: runtime configured address.
  * @runtime_direction: runtime configured direction.
- * @src_dev_addr: device source address for the channel transfer.
- * @dst_dev_addr: device destination address for the channel transfer.
  *
  * This struct can either "be" a logical or a physical channel.
  */
 struct d40_chan {
 	spinlock_t			 lock;
 	int				 log_num;
-	/* ID of the most recent completed transfer */
-	int				 completed;
 	int				 pending_tx;
 	bool				 busy;
 	struct d40_phy_res		*phy_chan;
@@ -289,7 +274,6 @@ struct d40_chan {
 	struct list_head		 client;
 	struct list_head		 pending_queue;
 	struct list_head		 active;
-	struct list_head		 done;
 	struct list_head		 queue;
 	struct list_head		 prepare_queue;
 	struct stedma40_chan_cfg	 dma_cfg;
@@ -302,10 +286,7 @@ struct d40_chan {
 	struct d40_log_lli_full		*lcpa;
 	/* Runtime reconfiguration */
 	dma_addr_t			runtime_addr;
-	enum dma_data_direction		runtime_direction;
-	dma_addr_t			 src_dev_addr;
-	dma_addr_t			 dst_dev_addr;
-	struct list_head		list;
+	enum dma_transfer_direction	runtime_direction;
 };
 
 /**
@@ -507,7 +488,6 @@ static void d40_pool_lli_free(struct d40_chan *d40c, struct d40_desc *d40d)
 	d40d->lli_log.dst = NULL;
 	d40d->lli_phy.src = NULL;
 	d40d->lli_phy.dst = NULL;
-	d40d->last_lcla = NULL;
 }
 
 static int d40_lcla_alloc_one(struct d40_chan *d40c,
@@ -516,18 +496,19 @@ static int d40_lcla_alloc_one(struct d40_chan *d40c,
 	unsigned long flags;
 	int i;
 	int ret = -EINVAL;
+	int p;
 
 	spin_lock_irqsave(&d40c->base->lcla_pool.lock, flags);
+
+	p = d40c->phy_chan->num * D40_LCLA_LINK_PER_EVENT_GRP;
 
 	/*
 	 * Allocate both src and dst at the same time, therefore the half
 	 * start on 1 since 0 can't be used since zero is used as end marker.
 	 */
 	for (i = 1 ; i < D40_LCLA_LINK_PER_EVENT_GRP / 2; i++) {
-		int idx = d40c->phy_chan->num * D40_LCLA_LINK_PER_EVENT_GRP + i;
-
-		if (!d40c->base->lcla_pool.alloc_map[idx]) {
-			d40c->base->lcla_pool.alloc_map[idx] = d40d;
+		if (!d40c->base->lcla_pool.alloc_map[p + i]) {
+			d40c->base->lcla_pool.alloc_map[p + i] = d40d;
 			d40d->lcla_alloc++;
 			ret = i;
 			break;
@@ -552,10 +533,10 @@ static int d40_lcla_free_all(struct d40_chan *d40c,
 	spin_lock_irqsave(&d40c->base->lcla_pool.lock, flags);
 
 	for (i = 1 ; i < D40_LCLA_LINK_PER_EVENT_GRP / 2; i++) {
-		int idx = d40c->phy_chan->num * D40_LCLA_LINK_PER_EVENT_GRP + i;
-
-		if (d40c->base->lcla_pool.alloc_map[idx] == d40d) {
-			d40c->base->lcla_pool.alloc_map[idx] = NULL;
+		if (d40c->base->lcla_pool.alloc_map[d40c->phy_chan->num *
+						    D40_LCLA_LINK_PER_EVENT_GRP + i] == d40d) {
+			d40c->base->lcla_pool.alloc_map[d40c->phy_chan->num *
+							D40_LCLA_LINK_PER_EVENT_GRP + i] = NULL;
 			d40d->lcla_alloc--;
 			if (d40d->lcla_alloc == 0) {
 				ret = 0;
@@ -632,98 +613,94 @@ static void d40_phy_lli_load(struct d40_chan *chan, struct d40_desc *desc)
 	writel(lli_dst->reg_lnk, base + D40_CHAN_REG_SDLNK);
 }
 
-static void d40_desc_done(struct d40_chan *d40c, struct d40_desc *desc)
+static void d40_log_lli_to_lcxa(struct d40_chan *chan, struct d40_desc *desc)
 {
-	list_add_tail(&desc->node, &d40c->done);
-}
-
-static int d40_desc_log_lli_to_lcxa(struct d40_chan *d40c,
-				    struct d40_desc *d40d,
-				    bool use_lcpa)
-{
-	struct d40_log_lli_bidir *lli = &d40d->lli_log;
+	struct d40_lcla_pool *pool = &chan->base->lcla_pool;
+	struct d40_log_lli_bidir *lli = &desc->lli_log;
+	int lli_current = desc->lli_current;
+	int lli_len = desc->lli_len;
+	bool cyclic = desc->cyclic;
 	int curr_lcla = -EINVAL;
 	int first_lcla = 0;
-	bool use_esram_lcla = d40c->base->plat_data->use_esram_lcla;
+	bool use_esram_lcla = chan->base->plat_data->use_esram_lcla;
+	bool linkback;
 
-	if ((d40d->lli_len - d40d->lli_current) > 1 ||
-	     d40d->cyclic || !use_lcpa) {
+	/*
+	 * We may have partially running cyclic transfers, in case we did't get
+	 * enough LCLA entries.
+	 */
+	linkback = cyclic && lli_current == 0;
 
-		/*
-		 * If the channel is expected to use only soft_lli don't
-		 * allocate a lcla. This is to avoid a HW issue that exists
-		 * in some controller during a peripheral to memory transfer
-		 * that uses linked lists.
-		 */
-		if (!(d40c->phy_chan->use_soft_lli &&
-			d40c->dma_cfg.dir == STEDMA40_PERIPH_TO_MEM))
-			curr_lcla = d40_lcla_alloc_one(d40c, d40d);
-
+	/*
+	 * For linkback, we need one LCLA even with only one link, because we
+	 * can't link back to the one in LCPA space
+	 */
+	if (linkback || (lli_len - lli_current > 1)) {
+		curr_lcla = d40_lcla_alloc_one(chan, desc);
 		first_lcla = curr_lcla;
 	}
 
-	if (!d40d->cyclic && use_lcpa) {
-		d40_log_lli_lcpa_write(d40c->lcpa,
-				       &lli->dst[d40d->lli_current],
-				       &lli->src[d40d->lli_current],
-				       curr_lcla,
-				       curr_lcla == -EINVAL);
+	/*
+	 * For linkback, we normally load the LCPA in the loop since we need to
+	 * link it to the second LCLA and not the first.  However, if we
+	 * couldn't even get a first LCLA, then we have to run in LCPA and
+	 * reload manually.
+	 */
+	if (!linkback || curr_lcla == -EINVAL) {
+		unsigned int flags = 0;
 
-		d40d->lli_current++;
+		if (curr_lcla == -EINVAL)
+			flags |= LLI_TERM_INT;
+
+		d40_log_lli_lcpa_write(chan->lcpa,
+				       &lli->dst[lli_current],
+				       &lli->src[lli_current],
+				       curr_lcla,
+				       flags);
+		lli_current++;
 	}
 
-	/*
-	 * Run only in LCPA space for non-cyclic.  For cyclic, caller
-	 * will handle the error.
-	 */
-	if (first_lcla < 0)
-		return first_lcla;
+	if (curr_lcla < 0)
+		goto out;
 
-	for (; d40d->lli_current < d40d->lli_len; d40d->lli_current++) {
-		unsigned int lcla_offset = d40c->phy_chan->num * 1024 +
+	for (; lli_current < lli_len; lli_current++) {
+		unsigned int lcla_offset = chan->phy_chan->num * 1024 +
 					   8 * curr_lcla * 2;
-		struct d40_lcla_pool *pool = &d40c->base->lcla_pool;
 		struct d40_log_lli *lcla = pool->base + lcla_offset;
-		int lli_current = d40d->lli_current;
+		unsigned int flags = 0;
 		int next_lcla;
-		bool interrupt;
 
-		if (d40d->lli_current + 1 < d40d->lli_len)
-			next_lcla = d40_lcla_alloc_one(d40c, d40d);
+		if (lli_current + 1 < lli_len)
+			next_lcla = d40_lcla_alloc_one(chan, desc);
 		else
-			next_lcla = d40d->cyclic ? first_lcla : -EINVAL;
+			next_lcla = linkback ? first_lcla : -EINVAL;
 
-		interrupt = d40d->cyclic
-			    ? d40d->txd.flags & DMA_PREP_INTERRUPT
-			    : next_lcla == -EINVAL;
+		if (cyclic || next_lcla == -EINVAL)
+			flags |= LLI_TERM_INT;
 
-		if (d40d->cyclic && curr_lcla == first_lcla) {
-			/*
-			 * For cyclic transactions, the first link is
-			 * present in both LCPA and LCLA space because
-			 * we can't link back to the one in LCPA space.
-			 */
-			d40_log_lli_lcpa_write(d40c->lcpa,
+		if (linkback && curr_lcla == first_lcla) {
+			/* First link goes in both LCPA and LCLA */
+			d40_log_lli_lcpa_write(chan->lcpa,
 					       &lli->dst[lli_current],
 					       &lli->src[lli_current],
-					       next_lcla,
-					       interrupt);
+					       next_lcla, flags);
 		}
 
+		/*
+		 * One unused LCLA in the cyclic case if the very first
+		 * next_lcla fails...
+		 */
 		d40_log_lli_lcla_write(lcla,
 				       &lli->dst[lli_current],
 				       &lli->src[lli_current],
-				       next_lcla,
-				       interrupt);
+				       next_lcla, flags);
 
-		if (d40d->lli_current == d40d->lli_len - 1)
-			d40d->last_lcla = lcla;
 		/*
 		 * Cache maintenance is not needed if lcla is
 		 * mapped in esram
 		 */
 		if (!use_esram_lcla) {
-			dma_sync_single_range_for_device(d40c->base->dev,
+			dma_sync_single_range_for_device(chan->base->dev,
 						pool->dma_addr, lcla_offset,
 						2 * sizeof(struct d40_log_lli),
 						DMA_TO_DEVICE);
@@ -731,13 +708,13 @@ static int d40_desc_log_lli_to_lcxa(struct d40_chan *d40c,
 		curr_lcla = next_lcla;
 
 		if (curr_lcla == -EINVAL || curr_lcla == first_lcla) {
-			d40d->lli_current++;
+			lli_current++;
 			break;
 		}
-
 	}
 
-	return first_lcla;
+out:
+	desc->lli_current = lli_current;
 }
 
 static void d40_desc_load(struct d40_chan *d40c, struct d40_desc *d40d)
@@ -746,7 +723,7 @@ static void d40_desc_load(struct d40_chan *d40c, struct d40_desc *d40d)
 		d40_phy_lli_load(d40c, d40d);
 		d40d->lli_current = d40d->lli_len;
 	} else
-		(void) d40_desc_log_lli_to_lcxa(d40c, d40d, true);
+		d40_log_lli_to_lcxa(d40c, d40d);
 }
 
 static struct d40_desc *d40_first_active_get(struct d40_chan *d40c)
@@ -796,12 +773,63 @@ static struct d40_desc *d40_first_queued(struct d40_chan *d40c)
 	return d;
 }
 
-static struct d40_desc *d40_first_done(struct d40_chan *d40c)
+static int d40_psize_2_burst_size(bool is_log, int psize)
 {
-	if (list_empty(&d40c->done))
-		return NULL;
+	if (is_log) {
+		if (psize == STEDMA40_PSIZE_LOG_1)
+			return 1;
+	} else {
+		if (psize == STEDMA40_PSIZE_PHY_1)
+			return 1;
+	}
 
-	return list_first_entry(&d40c->done, struct d40_desc, node);
+	return 2 << psize;
+}
+
+/*
+ * The dma only supports transmitting packages up to
+ * STEDMA40_MAX_SEG_SIZE << data_width. Calculate the total number of
+ * dma elements required to send the entire sg list
+ */
+static int d40_size_2_dmalen(int size, u32 data_width1, u32 data_width2)
+{
+	int dmalen;
+	u32 max_w = max(data_width1, data_width2);
+	u32 min_w = min(data_width1, data_width2);
+	u32 seg_max = ALIGN(STEDMA40_MAX_SEG_SIZE << min_w, 1 << max_w);
+
+	if (seg_max > STEDMA40_MAX_SEG_SIZE)
+		seg_max -= (1 << max_w);
+
+	if (!IS_ALIGNED(size, 1 << max_w))
+		return -EINVAL;
+
+	if (size <= seg_max)
+		dmalen = 1;
+	else {
+		dmalen = size / seg_max;
+		if (dmalen * seg_max < size)
+			dmalen++;
+	}
+	return dmalen;
+}
+
+static int d40_sg_2_dmalen(struct scatterlist *sgl, int sg_len,
+			   u32 data_width1, u32 data_width2)
+{
+	struct scatterlist *sg;
+	int i;
+	int len = 0;
+	int ret;
+
+	for_each_sg(sgl, sg, sg_len, i) {
+		ret = d40_size_2_dmalen(sg_dma_len(sg),
+					data_width1, data_width2);
+		if (ret < 0)
+			return ret;
+		len += ret;
+	}
+	return len;
 }
 
 
@@ -892,11 +920,6 @@ static int __d40_execute_command_phy(struct d40_chan *d40c,
 			goto done;
 	}
 
-#ifdef CONFIG_STE_DMA40_DEBUG
-	if (command == D40_DMA_RUN)
-		sted40_history_snapshot();
-#endif
-
 	wmask = 0xffffffff & ~(D40_CHAN_POS_MASK(d40c->phy_chan->num));
 	writel(wmask | (command << D40_CHAN_POS(d40c->phy_chan->num)),
 	       active_reg);
@@ -925,9 +948,6 @@ static int __d40_execute_command_phy(struct d40_chan *d40c,
 				"unable to suspend the chl %d (log: %d) status %x\n",
 				d40c->phy_chan->num, d40c->log_num,
 				status);
-#ifdef CONFIG_STE_DMA40_DEBUG
-			sted40_history_dump();
-#endif
 			dump_stack();
 			ret = -EBUSY;
 		}
@@ -942,12 +962,6 @@ static void d40_term_all(struct d40_chan *d40c)
 {
 	struct d40_desc *d40d;
 	struct d40_desc *_d;
-
-	/* Release completed descriptors */
-	while ((d40d = d40_first_done(d40c))) {
-		d40_desc_remove(d40d);
-		d40_desc_free(d40c, d40d);
-	}
 
 	/* Release active descriptors */
 	while ((d40d = d40_first_active_get(d40c))) {
@@ -1223,12 +1237,13 @@ static u32 d40_residue(struct d40_chan *d40c)
 	u32 num_elt;
 
 	if (chan_is_logical(d40c))
-		num_elt = (readl(&d40c->lcpa->lcsp2) &
-			   D40_MEM_LCSP2_ECNT_MASK) >> D40_MEM_LCSP2_ECNT_POS;
-	else
-		num_elt = (readl(chan_base(d40c) + D40_CHAN_REG_SDELT) &
-			   D40_SREG_ELEM_PHY_ECNT_MASK) >>
-			D40_SREG_ELEM_PHY_ECNT_POS;
+		num_elt = (readl(&d40c->lcpa->lcsp2) & D40_MEM_LCSP2_ECNT_MASK)
+			>> D40_MEM_LCSP2_ECNT_POS;
+	else {
+		u32 val = readl(chan_base(d40c) + D40_CHAN_REG_SDELT);
+		num_elt = (val & D40_SREG_ELEM_PHY_ECNT_MASK)
+			  >> D40_SREG_ELEM_PHY_ECNT_POS;
+	}
 
 	return num_elt * (1 << d40c->dma_cfg.dst_info.data_width);
 }
@@ -1246,10 +1261,8 @@ static bool d40_tx_is_linked(struct d40_chan *d40c)
 	return is_link;
 }
 
-static int d40_pause(struct dma_chan *chan)
+static int d40_pause(struct d40_chan *d40c)
 {
-	struct d40_chan *d40c =
-		container_of(chan, struct d40_chan, chan);
 	int res = 0;
 	unsigned long flags;
 
@@ -1267,10 +1280,8 @@ static int d40_pause(struct dma_chan *chan)
 	return res;
 }
 
-static int d40_resume(struct dma_chan *chan)
+static int d40_resume(struct d40_chan *d40c)
 {
-	struct d40_chan *d40c =
-		container_of(chan, struct d40_chan, chan);
 	int res = 0;
 	unsigned long flags;
 
@@ -1297,21 +1308,14 @@ static dma_cookie_t d40_tx_submit(struct dma_async_tx_descriptor *tx)
 					     chan);
 	struct d40_desc *d40d = container_of(tx, struct d40_desc, txd);
 	unsigned long flags;
+	dma_cookie_t cookie;
 
 	spin_lock_irqsave(&d40c->lock, flags);
-
-	d40c->chan.cookie++;
-
-	if (d40c->chan.cookie < 0)
-		d40c->chan.cookie = 1;
-
-	d40d->txd.cookie = d40c->chan.cookie;
-
+	cookie = dma_cookie_assign(tx);
 	d40_desc_queue(d40c, d40d);
-
 	spin_unlock_irqrestore(&d40c->lock, flags);
 
-	return tx->cookie;
+	return cookie;
 }
 
 static int d40_start(struct d40_chan *d40c)
@@ -1356,56 +1360,49 @@ static struct d40_desc *d40_queue_start(struct d40_chan *d40c)
 static void dma_tc_handle(struct d40_chan *d40c)
 {
 	struct d40_desc *d40d;
-	bool islastactive;
 
 	/* Get first active entry from list */
-redo:
 	d40d = d40_first_active_get(d40c);
 
 	if (d40d == NULL)
 		return;
 
 	if (d40d->cyclic) {
-		d40c->pending_tx++;
-		tasklet_schedule(&d40c->tasklet);
-		return;
-	}
+		/*
+		 * If this was a paritially loaded list, we need to reloaded
+		 * it, and only when the list is completed.  We need to check
+		 * for done because the interrupt will hit for every link, and
+		 * not just the last one.
+		 */
+		if (d40d->lli_current < d40d->lli_len
+		    && !d40_tx_is_linked(d40c)
+		    && !d40_residue(d40c)) {
+			d40_lcla_free_all(d40c, d40d);
+			d40_desc_load(d40c, d40d);
+			(void) d40_start(d40c);
 
-	d40_lcla_free_all(d40c, d40d);
+			if (d40d->lli_current == d40d->lli_len)
+				d40d->lli_current = 0;
+		}
+	} else {
+		d40_lcla_free_all(d40c, d40d);
 
-	if (d40d->lli_current < d40d->lli_len) {
-		d40_desc_load(d40c, d40d);
-		/* Start dma job */
-		(void) d40_start(d40c);
-		return;
-	}
+		if (d40d->lli_current < d40d->lli_len) {
+			d40_desc_load(d40c, d40d);
+			/* Start dma job */
+			(void) d40_start(d40c);
+			return;
+		}
 
-	/*
-	 * More than one active happens when we have
-	 * hw linked transfers.
-	 */
-	islastactive = list_is_last(&d40d->node, &d40c->active);
-	if (islastactive && d40_queue_start(d40c) == NULL) {
-		d40c->busy = false;
+		if (d40_queue_start(d40c) == NULL)
+			d40c->busy = false;
 		pm_runtime_mark_last_busy(d40c->base->dev);
 		pm_runtime_put_autosuspend(d40c->base->dev);
 	}
 
-	d40_desc_remove(d40d);
-	d40_desc_done(d40c, d40d);
-
 	d40c->pending_tx++;
 	tasklet_schedule(&d40c->tasklet);
 
-	/*
-	 * When we have multiple active transfers, there is a chance that we
-	 * might miss some link interrupts if the time to perform each link is
-	 * very small (mostly with mem-to-mem transfers).  So, if the hardware
-	 * is not transmitting any more links, assume that all the active
-	 * transfers are complete.
-	 */
-	if (!islastactive && !d40_tx_is_linked(d40c))
-		goto redo;
 }
 
 static void dma_tasklet(unsigned long data)
@@ -1418,17 +1415,13 @@ static void dma_tasklet(unsigned long data)
 
 	spin_lock_irqsave(&d40c->lock, flags);
 
-	/* Get first entry from the done list */
-	d40d = d40_first_done(d40c);
-	if (d40d == NULL) {
-		/* Check if we have reached here for cyclic job */
-		d40d = d40_first_active_get(d40c);
-		if (d40d == NULL || !d40d->cyclic)
-			goto err;
-	}
+	/* Get first active entry from list */
+	d40d = d40_first_active_get(d40c);
+	if (d40d == NULL)
+		goto err;
 
 	if (!d40d->cyclic)
-		d40c->completed = d40d->txd.cookie;
+		dma_cookie_complete(&d40d->txd);
 
 	/*
 	 * If terminating a channel pending_tx is set to zero.
@@ -1440,7 +1433,6 @@ static void dma_tasklet(unsigned long data)
 	}
 
 	/* Callback to client */
-
 	callback = d40d->txd.callback;
 	callback_param = d40d->txd.callback_param;
 
@@ -1448,11 +1440,13 @@ static void dma_tasklet(unsigned long data)
 		if (async_tx_test_ack(&d40d->txd)) {
 			d40_desc_remove(d40d);
 			d40_desc_free(d40c, d40d);
-		} else if (!d40d->is_in_client_list) {
-			d40_desc_remove(d40d);
-			d40_lcla_free_all(d40c, d40d);
-			list_add_tail(&d40d->node, &d40c->client);
-			d40d->is_in_client_list = true;
+		} else {
+			if (!d40d->is_in_client_list) {
+				d40_desc_remove(d40d);
+				d40_lcla_free_all(d40c, d40d);
+				list_add_tail(&d40d->node, &d40c->client);
+				d40d->is_in_client_list = true;
+			}
 		}
 	}
 
@@ -1500,9 +1494,7 @@ static irqreturn_t d40_handle_interrupt(int irq, void *data)
 	struct d40_base *base = data;
 
 	spin_lock_irqsave(&base->interrupt_lock, flags);
-#ifdef CONFIG_STE_DMA40_DEBUG
-	sted40_history_text("IRQ enter");
-#endif
+
 	/* Read interrupt status of both logical and physical channels */
 	for (i = 0; i < ARRAY_SIZE(il); i++)
 		regs[i] = readl(base->virtbase + il[i].src);
@@ -1519,40 +1511,24 @@ static irqreturn_t d40_handle_interrupt(int irq, void *data)
 		row = chan / BITS_PER_LONG;
 		idx = chan & (BITS_PER_LONG - 1);
 
+		/* ACK interrupt */
+		writel(1 << idx, base->virtbase + il[row].clr);
+
 		if (il[row].offset == D40_PHY_CHAN)
 			d40c = base->lookup_phy_chans[idx];
 		else
 			d40c = base->lookup_log_chans[il[row].offset + idx];
-
-		if (!d40c) {
-			/*
-			 * No error because this can happen if something else
-			 * in the system is using the channel.
-			 */
-			continue;
-		}
-
-		/* ACK interrupt */
-		writel(1 << idx, base->virtbase + il[row].clr);
-
 		spin_lock(&d40c->lock);
 
-		if (!il[row].is_error) {
-
+		if (!il[row].is_error)
 			dma_tc_handle(d40c);
-		} else {
+		else
 			d40_err(base->dev, "IRQ chan: %ld offset %d idx %d\n",
 				chan, il[row].offset, idx);
-#ifdef CONFIG_STE_DMA40_DEBUG
-			sted40_history_dump();
-#endif
-		}
 
 		spin_unlock(&d40c->lock);
 	}
-#ifdef CONFIG_STE_DMA40_DEBUG
-	sted40_history_text("IRQ leave");
-#endif
+
 	spin_unlock_irqrestore(&base->interrupt_lock, flags);
 
 	return IRQ_HANDLED;
@@ -1572,14 +1548,17 @@ static int d40_validate_conf(struct d40_chan *d40c,
 	}
 
 	if (conf->dst_dev_type != STEDMA40_DEV_DST_MEMORY &&
-	   d40c->base->plat_data->dev_tx[conf->dst_dev_type] == 0) {
+	    d40c->base->plat_data->dev_tx[conf->dst_dev_type] == 0 &&
+	    d40c->runtime_addr == 0) {
+
 		chan_err(d40c, "Invalid TX channel address (%d)\n",
 			 conf->dst_dev_type);
 		res = -EINVAL;
 	}
 
 	if (conf->src_dev_type != STEDMA40_DEV_SRC_MEMORY &&
-	   d40c->base->plat_data->dev_rx[conf->src_dev_type] == 0) {
+	    d40c->base->plat_data->dev_rx[conf->src_dev_type] == 0 &&
+	    d40c->runtime_addr == 0) {
 		chan_err(d40c, "Invalid RX channel address (%d)\n",
 			conf->src_dev_type);
 		res = -EINVAL;
@@ -1615,6 +1594,19 @@ static int d40_validate_conf(struct d40_chan *d40c,
 		 * in case any dma client requires it.
 		 */
 		chan_err(d40c, "periph to periph not supported\n");
+		res = -EINVAL;
+	}
+
+	if (d40_psize_2_burst_size(is_log, conf->src_info.psize) *
+	    (1 << conf->src_info.data_width) !=
+	    d40_psize_2_burst_size(is_log, conf->dst_info.psize) *
+	    (1 << conf->dst_info.data_width)) {
+		/*
+		 * The DMAC hardware only supports
+		 * src (burst x width) == dst (burst x width)
+		 */
+
+		chan_err(d40c, "src (burst x width) != dst (burst x width)\n");
 		res = -EINVAL;
 	}
 
@@ -1756,7 +1748,8 @@ static int d40_allocate_channel(struct d40_chan *d40c, bool *first_phy_user)
 				int phy_num = j  + event_group * 2;
 				for (i = phy_num; i < phy_num + 2; i++) {
 					if (d40_alloc_mask_set(&phys[i],
-							       is_src, 0,
+							       is_src,
+							       0,
 							       is_log,
 							       first_phy_user))
 						goto found_phy;
@@ -1784,12 +1777,12 @@ found_phy:
 				return -EINVAL;
 			}
 
-			if (d40_alloc_mask_set(&phys[i], is_src, event_line, is_log,
-					       first_phy_user))
+			if (d40_alloc_mask_set(&phys[i], is_src, event_line,
+					       is_log, first_phy_user))
 				goto found_log;
 
 			dev_err(chan2dev(d40c),
-				"could not allocated fixed phy channel %d\n", i);
+				"could not allocate fixed phy channel %d\n", i);
 			return -EINVAL;
 		}
 
@@ -1914,154 +1907,6 @@ out:
 	return res;
 }
 
-struct d40_base *_base;
-static DEFINE_SPINLOCK(list_lock);
-static LIST_HEAD(list);
-static dma_addr_t d40_dev_rx_addr(struct d40_chan *d40c);
-static dma_addr_t d40_dev_tx_addr(struct d40_chan *d40c);
-
-static dma_addr_t d40_dev_rx_addr(struct d40_chan *d40c)
-{
-	dma_addr_t dev_addr = 0;
-
-	if (d40c->runtime_addr)
-		dev_addr = d40c->runtime_addr;
-	else if (d40c->src_dev_addr)
-		dev_addr = d40c->src_dev_addr;
-	else
-		dev_addr = d40c->base->plat_data->
-			   dev_rx[d40c->dma_cfg.src_dev_type];
-
-	return dev_addr;
-}
-
-static dma_addr_t d40_dev_tx_addr(struct d40_chan *d40c)
-{
-	dma_addr_t dev_addr = 0;
-
-	if (d40c->runtime_addr)
-		dev_addr = d40c->runtime_addr;
-	else if (d40c->dst_dev_addr)
-		dev_addr = d40c->dst_dev_addr;
-	else
-		dev_addr = d40c->base->plat_data->
-			   dev_tx[d40c->dma_cfg.dst_dev_type];
-
-	return dev_addr;
-}
-
-
-static void __d40_dump_descs(int num, const char *name, struct list_head *list)
-{
-	struct d40_desc *desc;
-	int i;
-
-	list_for_each_entry(desc, list, node) {
-		struct d40_log_lli_bidir *lli = &desc->lli_log;
-
-		for (i = 0; i < desc->lli_len; i++) {
-			pr_info("%d: %s: src %#010x %#010x dst %#010x %#010x\n",
-				num,
-				name,
-				lli->src[i].lcsp02,
-				lli->src[i].lcsp13,
-				lli->dst[i].lcsp02,
-				lli->dst[i].lcsp13);
-		}
-	}
-}
-
-static void __d40_dump_channel(struct d40_chan *chan)
-{
-	struct device *dev = chan2dev(chan);
-	static dma_addr_t rx = 0xbeefcafe, tx = 0xbeefcafe;
-
-	if (chan->dma_cfg.src_dev_type != -1)
-		rx = d40_dev_rx_addr(chan);
-
-	if (chan->dma_cfg.dst_dev_type != -1)
-		tx = d40_dev_tx_addr(chan);
-
-	dev_info(dev, "log-%d: busy: %d phy: %d pending_tx: %d"
-			" completed: %d rxaddr: %#010x txaddr: %#010x\n",
-		 chan->log_num, chan->busy, chan->phy_chan->num,
-		 chan->pending_tx, chan->completed,
-		 rx, tx);
-
-	dev_info(dev, "log-%d: lcpa %#010x %#010x %#010x %#010x\n",
-		 chan->log_num,
-		 chan->lcpa->lcsp0,
-		 chan->lcpa->lcsp1,
-		 chan->lcpa->lcsp2,
-		 chan->lcpa->lcsp3);
-
-	__d40_dump_descs(chan->log_num, " queue", &chan->queue);
-	__d40_dump_descs(chan->log_num, "active", &chan->active);
-	__d40_dump_descs(chan->log_num, " done", &chan->done);
-	__d40_dump_descs(chan->log_num, "client", &chan->client);
-}
-
-static void d40_dump_channels(void)
-{
-	struct d40_chan *chan, *temp;
-
-	list_for_each_entry_safe(chan, temp, &list, list) {
-		unsigned long flags;
-
-		spin_lock_irqsave(&chan->lock, flags);
-		__d40_dump_channel(chan);
-		spin_unlock_irqrestore(&chan->lock, flags);
-	}
-
-}
-
-void stedma40_dump_state(void)
-{
-	int i;
-
-	pr_info("LCTIS: %#010x %#010x %#010x %#010x\n",
-		readl_relaxed(_base->virtbase + D40_DREG_LCTIS0),
-		readl_relaxed(_base->virtbase + D40_DREG_LCTIS1),
-		readl_relaxed(_base->virtbase + D40_DREG_LCTIS2),
-		readl_relaxed(_base->virtbase + D40_DREG_LCTIS3));
-
-	pr_info("LCEIS: %#010x %#010x %#010x %#010x\n",
-		readl_relaxed(_base->virtbase + D40_DREG_LCEIS0),
-		readl_relaxed(_base->virtbase + D40_DREG_LCEIS1),
-		readl_relaxed(_base->virtbase + D40_DREG_LCEIS2),
-		readl_relaxed(_base->virtbase + D40_DREG_LCEIS3));
-
-	pr_info("PCTIS: %#010x PCEIS: %#010x\n",
-		readl_relaxed(_base->virtbase + D40_DREG_PCTIS),
-		readl_relaxed(_base->virtbase + D40_DREG_PCEIS));
-
-	pr_info("GCC: %#x ACTIVE: %#x ACTIVO: %#x\n",
-		readl_relaxed(_base->virtbase + D40_DREG_GCC),
-		readl_relaxed(_base->virtbase + D40_DREG_ACTIVE),
-		readl_relaxed(_base->virtbase + D40_DREG_ACTIVO));
-
-#define ireg(x) readl_relaxed(_base->virtbase + D40_DREG_PCBASE + i \
-		* D40_DREG_PCDELTA + D40_CHAN_REG_##x)
-
-	for (i = 0; i < 8; i++) {
-		pr_info("%d: SSCFG %#010x SSELT %#010x SSPTR %#010x SSLNK %#010x\n",
-		       i, ireg(SSCFG), ireg(SSELT), ireg(SSPTR), ireg(SSLNK));
-
-		pr_info("%d: SDCFG %#010x SDELT %#010x SDPTR %#010x SDLNK %#010x\n",
-		       i, ireg(SDCFG), ireg(SDELT), ireg(SDPTR), ireg(SDLNK));
-	}
-
-	for (i = 0; i < 8; i++) {
-		char tmp[50];
-
-		snprintf(tmp, sizeof(tmp), "%d: LCLA: ", i);
-		print_hex_dump(KERN_INFO, tmp, DUMP_PREFIX_OFFSET, 16, 4,
-				_base->lcla_pool.base + SZ_1K * i, SZ_1K, true);
-	}
-
-	d40_dump_channels();
-}
-
 static bool d40_is_paused(struct d40_chan *d40c)
 {
 	void __iomem *chanbase = chan_base(d40c);
@@ -2111,6 +1956,21 @@ _exit:
 
 }
 
+
+static u32 stedma40_residue(struct dma_chan *chan)
+{
+	struct d40_chan *d40c =
+		container_of(chan, struct d40_chan, chan);
+	u32 bytes_left;
+	unsigned long flags;
+
+	spin_lock_irqsave(&d40c->lock, flags);
+	bytes_left = d40_residue(d40c);
+	spin_unlock_irqrestore(&d40c->lock, flags);
+
+	return bytes_left;
+}
+
 static int
 d40_prep_sg_log(struct d40_chan *chan, struct d40_desc *desc,
 		struct scatterlist *sg_src, struct scatterlist *sg_dst,
@@ -2126,13 +1986,15 @@ d40_prep_sg_log(struct d40_chan *chan, struct d40_desc *desc,
 				src_dev_addr,
 				desc->lli_log.src,
 				chan->log_def.lcsp1,
-				src_info->data_width);
+				src_info->data_width,
+				dst_info->data_width);
 
 	ret = d40_log_sg_to_lli(sg_dst, sg_len,
 				dst_dev_addr,
 				desc->lli_log.dst,
 				chan->log_def.lcsp3,
-				dst_info->data_width);
+				dst_info->data_width,
+				src_info->data_width);
 
 	return ret < 0 ? ret : 0;
 }
@@ -2146,23 +2008,23 @@ d40_prep_sg_phy(struct d40_chan *chan, struct d40_desc *desc,
 	struct stedma40_chan_cfg *cfg = &chan->dma_cfg;
 	struct stedma40_half_channel_info *src_info = &cfg->src_info;
 	struct stedma40_half_channel_info *dst_info = &cfg->dst_info;
+	unsigned long flags = 0;
 	int ret;
+
+	if (desc->cyclic)
+		flags |= LLI_CYCLIC | LLI_TERM_INT;
 
 	ret = d40_phy_sg_to_lli(sg_src, sg_len, src_dev_addr,
 				desc->lli_phy.src,
 				virt_to_phys(desc->lli_phy.src),
 				chan->src_def_cfg,
-				desc->cyclic,
-				desc->txd.flags & DMA_PREP_INTERRUPT,
-				src_info);
+				src_info, dst_info, flags);
 
 	ret = d40_phy_sg_to_lli(sg_dst, sg_len, dst_dev_addr,
 				desc->lli_phy.dst,
 				virt_to_phys(desc->lli_phy.dst),
 				chan->dst_def_cfg,
-				desc->cyclic,
-				desc->txd.flags & DMA_PREP_INTERRUPT,
-				dst_info);
+				dst_info, src_info, flags);
 
 	dma_sync_single_for_device(chan->base->dev, desc->lli_pool.dma_addr,
 				   desc->lli_pool.size, DMA_TO_DEVICE);
@@ -2170,10 +2032,12 @@ d40_prep_sg_phy(struct d40_chan *chan, struct d40_desc *desc,
 	return ret < 0 ? ret : 0;
 }
 
+
 static struct d40_desc *
 d40_prep_desc(struct d40_chan *chan, struct scatterlist *sg,
 	      unsigned int sg_len, unsigned long dma_flags)
 {
+	struct stedma40_chan_cfg *cfg = &chan->dma_cfg;
 	struct d40_desc *desc;
 	int ret;
 
@@ -2181,13 +2045,19 @@ d40_prep_desc(struct d40_chan *chan, struct scatterlist *sg,
 	if (!desc)
 		return NULL;
 
-	desc->lli_len = sg_len;
+	desc->lli_len = d40_sg_2_dmalen(sg, sg_len, cfg->src_info.data_width,
+					cfg->dst_info.data_width);
+	if (desc->lli_len < 0) {
+		chan_err(chan, "Unaligned size\n");
+		goto err;
+	}
 
 	ret = d40_pool_lli_alloc(chan, desc, desc->lli_len);
 	if (ret < 0) {
 		chan_err(chan, "Could not allocate lli\n");
 		goto err;
 	}
+
 
 	desc->lli_current = 0;
 	desc->txd.flags = dma_flags;
@@ -2203,27 +2073,19 @@ err:
 }
 
 static dma_addr_t
-d40_get_dev_addr(struct d40_chan *chan, enum dma_data_direction direction)
+d40_get_dev_addr(struct d40_chan *chan, enum dma_transfer_direction direction)
 {
 	struct stedma40_platform_data *plat = chan->base->plat_data;
 	struct stedma40_chan_cfg *cfg = &chan->dma_cfg;
-	dma_addr_t addr = -EINVAL;
+	dma_addr_t addr = 0;
 
 	if (chan->runtime_addr)
 		return chan->runtime_addr;
 
-	if (direction == DMA_FROM_DEVICE) {
-		if (chan->src_dev_addr)
-			addr = chan->src_dev_addr;
-		else
-			addr = plat->dev_rx[cfg->src_dev_type];
-
-	} else if (direction == DMA_TO_DEVICE) {
-		if (chan->dst_dev_addr)
-			addr = chan->dst_dev_addr;
-		else
-			addr = plat->dev_tx[cfg->dst_dev_type];
-	}
+	if (direction == DMA_DEV_TO_MEM)
+		addr = plat->dev_rx[cfg->src_dev_type];
+	else if (direction == DMA_MEM_TO_DEV)
+		addr = plat->dev_tx[cfg->dst_dev_type];
 
 	return addr;
 }
@@ -2231,7 +2093,7 @@ d40_get_dev_addr(struct d40_chan *chan, enum dma_data_direction direction)
 static struct dma_async_tx_descriptor *
 d40_prep_sg(struct dma_chan *dchan, struct scatterlist *sg_src,
 	    struct scatterlist *sg_dst, unsigned int sg_len,
-	    enum dma_data_direction direction, unsigned long dma_flags)
+	    enum dma_transfer_direction direction, unsigned long dma_flags)
 {
 	struct d40_chan *chan = container_of(dchan, struct d40_chan, chan);
 	dma_addr_t src_dev_addr = 0;
@@ -2245,6 +2107,7 @@ d40_prep_sg(struct dma_chan *dchan, struct scatterlist *sg_src,
 		return NULL;
 	}
 
+
 	spin_lock_irqsave(&chan->lock, flags);
 
 	desc = d40_prep_desc(chan, sg_src, sg_len, dma_flags);
@@ -2254,12 +2117,12 @@ d40_prep_sg(struct dma_chan *dchan, struct scatterlist *sg_src,
 	if (sg_next(&sg_src[sg_len - 1]) == sg_src)
 		desc->cyclic = true;
 
-	if (direction != DMA_NONE) {
+	if (direction != DMA_TRANS_NONE) {
 		dma_addr_t dev_addr = d40_get_dev_addr(chan, direction);
 
-		if (direction == DMA_FROM_DEVICE)
+		if (direction == DMA_DEV_TO_MEM)
 			src_dev_addr = dev_addr;
-		else if (direction == DMA_TO_DEVICE)
+		else if (direction == DMA_MEM_TO_DEV)
 			dst_dev_addr = dev_addr;
 	}
 
@@ -2318,24 +2181,11 @@ static void __d40_set_prio_rt(struct d40_chan *d40c, int dev_type, bool src)
 {
 	bool realtime = d40c->dma_cfg.realtime;
 	bool highprio = d40c->dma_cfg.high_priority;
+	u32 prioreg = highprio ? D40_DREG_PSEG1 : D40_DREG_PCEG1;
 	u32 rtreg = realtime ? D40_DREG_RSEG1 : D40_DREG_RCEG1;
 	u32 event = D40_TYPE_TO_EVENT(dev_type);
 	u32 group = D40_TYPE_TO_GROUP(dev_type);
 	u32 bit = 1 << event;
-	u32 prioreg;
-
-	/*
-	 * Due to a hardware bug, in some cases a logical channel triggered by
-	 * a high priority destination event line can generate extra packet
-	 * transactions.
-	 *
-	 * The workaround is to not set the high priority level for the
-	 * destination event lines that trigger logical channels.
-	 */
-	if (!src && chan_is_logical(d40c))
-		highprio = false;
-
-	prioreg = highprio ? D40_DREG_PSEG1 : D40_DREG_PCEG1;
 
 	/* Destination event lines are stored in the upper halfword */
 	if (!src)
@@ -2369,7 +2219,7 @@ static int d40_alloc_chan_resources(struct dma_chan *chan)
 	bool is_free_phy;
 	spin_lock_irqsave(&d40c->lock, flags);
 
-	d40c->completed = chan->cookie = 1;
+	dma_cookie_init(chan);
 
 	/* If no dma configuration is set use default configuration (memcpy) */
 	if (!d40c->configured) {
@@ -2403,14 +2253,15 @@ static int d40_alloc_chan_resources(struct dma_chan *chan)
 			  d40c->dma_cfg.src_dev_type * D40_LCPA_CHAN_SIZE;
 		else
 			d40c->lcpa = d40c->base->lcpa_base +
-				d40c->dma_cfg.dst_dev_type *
-				D40_LCPA_CHAN_SIZE + D40_LCPA_CHAN_DST_DELTA;
+			  d40c->dma_cfg.dst_dev_type *
+			  D40_LCPA_CHAN_SIZE + D40_LCPA_CHAN_DST_DELTA;
 	}
 
-	dev_info(chan2dev(d40c), "allocated %s channel (phy %d%s)\n",
+	dev_dbg(chan2dev(d40c), "allocated %s channel (phy %d%s)\n",
 		 chan_is_logical(d40c) ? "logical" : "physical",
 		 d40c->phy_chan->num,
 		 d40c->dma_cfg.use_fixed_channel ? ", fixed" : "");
+
 
 	/*
 	 * Only write channel configuration to the DMA if the physical
@@ -2419,15 +2270,10 @@ static int d40_alloc_chan_resources(struct dma_chan *chan)
 	 */
 	if (is_free_phy)
 		d40_config_write(d40c);
-
+fail:
 	pm_runtime_mark_last_busy(d40c->base->dev);
 	pm_runtime_put_autosuspend(d40c->base->dev);
-fail:
 	spin_unlock_irqrestore(&d40c->lock, flags);
-
-	spin_lock(&list_lock);
-	list_add_tail(&d40c->list, &list);
-	spin_unlock(&list_lock);
 	return err;
 }
 
@@ -2443,9 +2289,6 @@ static void d40_free_chan_resources(struct dma_chan *chan)
 		return;
 	}
 
-	spin_lock(&list_lock);
-	list_del(&d40c->list);
-	spin_unlock(&list_lock);
 
 	spin_lock_irqsave(&d40c->lock, flags);
 
@@ -2483,16 +2326,20 @@ d40_prep_memcpy_sg(struct dma_chan *chan,
 		   struct scatterlist *src_sg, unsigned int src_nents,
 		   unsigned long dma_flags)
 {
-	return d40_prep_sg(chan, src_sg, dst_sg, src_nents,
-						DMA_NONE, dma_flags);
+	if (dst_nents != src_nents)
+		return NULL;
+
+	return d40_prep_sg(chan, src_sg, dst_sg, src_nents, DMA_NONE, dma_flags);
 }
 
-static struct dma_async_tx_descriptor *
-d40_prep_slave_sg(struct dma_chan *chan, struct scatterlist *sgl,
-		  unsigned int sg_len, enum dma_data_direction direction,
-		  unsigned long dma_flags)
+static struct dma_async_tx_descriptor *d40_prep_slave_sg(struct dma_chan *chan,
+							 struct scatterlist *sgl,
+							 unsigned int sg_len,
+							 enum dma_transfer_direction direction,
+							 unsigned long dma_flags,
+							 void *context)
 {
-	if (direction != DMA_FROM_DEVICE && direction != DMA_TO_DEVICE)
+	if (direction != DMA_DEV_TO_MEM && direction != DMA_MEM_TO_DEV)
 		return NULL;
 
 	return d40_prep_sg(chan, sgl, sgl, sg_len, direction, dma_flags);
@@ -2501,14 +2348,14 @@ d40_prep_slave_sg(struct dma_chan *chan, struct scatterlist *sgl,
 static struct dma_async_tx_descriptor *
 dma40_prep_dma_cyclic(struct dma_chan *chan, dma_addr_t dma_addr,
 		     size_t buf_len, size_t period_len,
-		     enum dma_data_direction direction)
+		     enum dma_transfer_direction direction, void *context)
 {
 	unsigned int periods = buf_len / period_len;
 	struct dma_async_tx_descriptor *txd;
 	struct scatterlist *sg;
 	int i;
 
-	sg = kcalloc(periods + 1, sizeof(struct scatterlist), GFP_ATOMIC);
+	sg = kcalloc(periods + 1, sizeof(struct scatterlist), GFP_NOWAIT);
 	for (i = 0; i < periods; i++) {
 		sg_dma_address(&sg[i]) = dma_addr;
 		sg_dma_len(&sg[i]) = period_len;
@@ -2533,32 +2380,19 @@ static enum dma_status d40_tx_status(struct dma_chan *chan,
 				     struct dma_tx_state *txstate)
 {
 	struct d40_chan *d40c = container_of(chan, struct d40_chan, chan);
-	unsigned long flags;
-	dma_cookie_t last_used;
-	dma_cookie_t last_complete;
-	int ret;
+	enum dma_status ret;
 
 	if (d40c->phy_chan == NULL) {
 		chan_err(d40c, "Cannot read status of unallocated channel\n");
 		return -EINVAL;
 	}
 
-	last_complete = d40c->completed;
-	last_used = chan->cookie;
+	ret = dma_cookie_status(chan, cookie, txstate);
+	if (ret != DMA_SUCCESS)
+		dma_set_residue(txstate, stedma40_residue(chan));
 
 	if (d40_is_paused(d40c))
 		ret = DMA_PAUSED;
-	else
-		ret = dma_async_is_complete(cookie, last_complete, last_used);
-
-	if (txstate) {
-		txstate->last = last_complete;
-		txstate->used = last_used;
-
-		spin_lock_irqsave(&d40c->lock, flags);
-		txstate->residue = d40_residue(d40c);
-		spin_unlock_irqrestore(&d40c->lock, flags);
-	}
 
 	return ret;
 }
@@ -2600,7 +2434,6 @@ static void d40_terminate_all(struct dma_chan *chan)
 	d40_term_all(d40c);
 	pm_runtime_mark_last_busy(d40c->base->dev);
 	pm_runtime_put_autosuspend(d40c->base->dev);
-
 	if (d40c->busy) {
 		pm_runtime_mark_last_busy(d40c->base->dev);
 		pm_runtime_put_autosuspend(d40c->base->dev);
@@ -2683,7 +2516,7 @@ static int d40_set_runtime_config(struct dma_chan *chan,
 	dst_addr_width = config->dst_addr_width;
 	dst_maxburst = config->dst_maxburst;
 
-	if (config->direction == DMA_FROM_DEVICE) {
+	if (config->direction == DMA_DEV_TO_MEM) {
 		dma_addr_t dev_addr_rx =
 			d40c->base->plat_data->dev_rx[cfg->src_dev_type];
 
@@ -2706,7 +2539,7 @@ static int d40_set_runtime_config(struct dma_chan *chan,
 		if (dst_maxburst == 0)
 			dst_maxburst = src_maxburst;
 
-	} else if (config->direction == DMA_TO_DEVICE) {
+	} else if (config->direction == DMA_MEM_TO_DEV) {
 		dma_addr_t dev_addr_tx =
 			d40c->base->plat_data->dev_tx[cfg->dst_dev_type];
 
@@ -2728,7 +2561,6 @@ static int d40_set_runtime_config(struct dma_chan *chan,
 			src_addr_width = dst_addr_width;
 		if (src_maxburst == 0)
 			src_maxburst = dst_maxburst;
-
 	} else {
 		dev_err(d40c->base->dev,
 			"unrecognized channel direction %d\n",
@@ -2780,7 +2612,7 @@ static int d40_set_runtime_config(struct dma_chan *chan,
 		"configured channel %s for %s, data width %d/%d, "
 		"maxburst %d/%d elements, LE, no flow control\n",
 		dma_chan_name(chan),
-		(config->direction == DMA_FROM_DEVICE) ? "RX" : "TX",
+		(config->direction == DMA_DEV_TO_MEM) ? "RX" : "TX",
 		src_addr_width, dst_addr_width,
 		src_maxburst, dst_maxburst);
 
@@ -2802,9 +2634,9 @@ static int d40_control(struct dma_chan *chan, enum dma_ctrl_cmd cmd,
 		d40_terminate_all(chan);
 		return 0;
 	case DMA_PAUSE:
-		return d40_pause(chan);
+		return d40_pause(d40c);
 	case DMA_RESUME:
-		return d40_resume(chan);
+		return d40_resume(d40c);
 	case DMA_SLAVE_CONFIG:
 		return d40_set_runtime_config(chan,
 			(struct dma_slave_config *) arg);
@@ -2886,7 +2718,6 @@ static void __init d40_chan_init(struct d40_base *base, struct dma_device *dma,
 
 		d40c->log_num = D40_PHY_CHAN;
 
-		INIT_LIST_HEAD(&d40c->done);
 		INIT_LIST_HEAD(&d40c->active);
 		INIT_LIST_HEAD(&d40c->queue);
 		INIT_LIST_HEAD(&d40c->pending_queue);
@@ -2975,10 +2806,9 @@ static int __init d40_dmaengine_init(struct d40_base *base,
 	dma_cap_set(DMA_SLAVE, base->dma_both.cap_mask);
 	dma_cap_set(DMA_MEMCPY, base->dma_both.cap_mask);
 	dma_cap_set(DMA_SG, base->dma_both.cap_mask);
-	dma_cap_set(DMA_CYCLIC, base->dma_both.cap_mask);
+	dma_cap_set(DMA_CYCLIC, base->dma_slave.cap_mask);
 
 	d40_ops_init(base, &base->dma_both);
-
 	err = dma_async_device_register(&base->dma_both);
 
 	if (err) {
@@ -3067,7 +2897,7 @@ static int __init d40_phy_res_init(struct d40_base *base)
 	int num_phy_chans_avail = 0;
 	u32 val[2];
 	int odd_even_bit = -2;
-	u32 gcc = D40_DREG_GCC_ENA;
+	int gcc = D40_DREG_GCC_ENA;
 
 	val[0] = readl(base->virtbase + D40_DREG_PRSME);
 	val[1] = readl(base->virtbase + D40_DREG_PRSMO);
@@ -3075,13 +2905,11 @@ static int __init d40_phy_res_init(struct d40_base *base)
 	for (i = 0; i < base->num_phy_chans; i++) {
 		base->phy_res[i].num = i;
 		odd_even_bit += 2 * ((i % 2) == 0);
-		if (((val[i % 2] >> odd_even_bit) & D40_DREG_PRSM_MODE_MASK)
-		      == D40_DREG_PRSM_MODE_SECURE) {
+		if (((val[i % 2] >> odd_even_bit) & 3) == 1) {
 			/* Mark security only channels as occupied */
 			base->phy_res[i].allocated_src = D40_ALLOC_PHY;
 			base->phy_res[i].allocated_dst = D40_ALLOC_PHY;
 			base->phy_res[i].reserved = true;
-
 			gcc |= D40_DREG_GCC_EVTGRP_ENA(D40_PHYS_TO_GROUP(i),
 						       D40_DREG_GCC_SRC);
 			gcc |= D40_DREG_GCC_EVTGRP_ENA(D40_PHYS_TO_GROUP(i),
@@ -3109,13 +2937,6 @@ static int __init d40_phy_res_init(struct d40_base *base)
 		gcc |= D40_DREG_GCC_EVTGRP_ENA(D40_PHYS_TO_GROUP(chan),
 					       D40_DREG_GCC_DST);
 		num_phy_chans_avail--;
-	}
-
-	/* Mark soft_lli channels */
-	for (i = 0; i < base->plat_data->num_of_soft_lli_chans; i++) {
-		int chan = base->plat_data->soft_lli_chans[i];
-
-		base->phy_res[chan].use_soft_lli = true;
 	}
 
 	dev_info(base->dev, "%d of %d physical DMA channels available\n",
@@ -3168,10 +2989,6 @@ static struct d40_base * __init d40_hw_detect_init(struct platform_device *pdev)
 		goto failure;
 	}
 
-	/*
-	 * Since the secure world does not handle clock, we have to
-	 * let it run all the time
-	 */
 	clk_enable(clk);
 
 	/* Get IO for DMAC base address */
@@ -3441,8 +3258,8 @@ static int __init d40_lcla_allocate(struct d40_base *base)
 		base->lcla_pool.base = (void *)page_list[i];
 	} else {
 		/*
-		 * After many attempts, no succees with finding the correct
-		 * alignment try with allocating a big buffer.
+		 * After many attempts and no succees with finding the correct
+		 * alignment, try with allocating a big buffer.
 		 */
 		dev_warn(base->dev,
 			 "[%s] Failed to get %d pages @ 18 bit align.\n",
@@ -3545,7 +3362,7 @@ static int __init d40_probe(struct platform_device *pdev)
 						resource_size(res));
 		if (!base->lcla_pool.base) {
 			ret = -ENOMEM;
-			d40_err(&pdev->dev,"Failed to ioremap LCLA region\n");
+			d40_err(&pdev->dev, "Failed to ioremap LCLA region\n");
 			goto failure;
 		}
 		writel(res->start, base->virtbase + D40_DREG_LCLA);
@@ -3558,13 +3375,6 @@ static int __init d40_probe(struct platform_device *pdev)
 		}
 	}
 
-#ifdef CONFIG_STE_DMA40_DEBUG
-	sted40_history_set_virtbase(base->virtbase,
-				    base->lcpa_base,
-				    base->lcpa_size,
-				    base->lcla_pool.base,
-				    SZ_1K * base->num_phy_chans);
-#endif
 	spin_lock_init(&base->lcla_pool.lock);
 
 	base->irq = platform_get_irq(pdev, 0);
@@ -3601,7 +3411,6 @@ static int __init d40_probe(struct platform_device *pdev)
 	}
 
 	base->initialized = true;
-
 	err = d40_dmaengine_init(base, num_reserved_chans);
 	if (err)
 		goto failure;
@@ -3614,7 +3423,6 @@ static int __init d40_probe(struct platform_device *pdev)
 	}
 
 	d40_hw_init(base);
-	_base = base;
 
 	dev_info(base->dev, "initialized\n");
 	return 0;

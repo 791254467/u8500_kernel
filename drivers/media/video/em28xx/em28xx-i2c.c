@@ -41,14 +41,6 @@ static unsigned int i2c_debug;
 module_param(i2c_debug, int, 0644);
 MODULE_PARM_DESC(i2c_debug, "enable debug messages [i2c]");
 
-
-#define dprintk1(lvl, fmt, args...)			\
-do {							\
-	if (i2c_debug >= lvl) {				\
-	printk(fmt, ##args);				\
-      }							\
-} while (0)
-
 #define dprintk2(lvl, fmt, args...)			\
 do {							\
 	if (i2c_debug >= lvl) {				\
@@ -181,15 +173,24 @@ static int em2800_i2c_recv_bytes(struct em28xx *dev, unsigned char addr,
 
 /*
  * em28xx_i2c_send_bytes()
- * untested for more than 4 bytes
  */
 static int em28xx_i2c_send_bytes(void *data, unsigned char addr, char *buf,
 				 short len, int stop)
 {
 	int wrcount = 0;
 	struct em28xx *dev = (struct em28xx *)data;
+	int write_timeout, ret;
 
 	wrcount = dev->em28xx_write_regs_req(dev, stop ? 2 : 3, addr, buf, len);
+
+	/* Seems to be required after a write */
+	for (write_timeout = EM2800_I2C_WRITE_TIMEOUT; write_timeout > 0;
+	     write_timeout -= 5) {
+		ret = dev->em28xx_read_reg(dev, 0x05);
+		if (!ret)
+			break;
+		msleep(5);
+	}
 
 	return wrcount;
 }
@@ -218,9 +219,7 @@ static int em28xx_i2c_recv_bytes(struct em28xx *dev, unsigned char addr,
  */
 static int em28xx_i2c_check_for_device(struct em28xx *dev, unsigned char addr)
 {
-	char msg;
 	int ret;
-	msg = addr;
 
 	ret = dev->em28xx_read_reg_req(dev, 2, addr);
 	if (ret < 0) {

@@ -12,6 +12,7 @@
 
 #include <linux/err.h>
 #include <linux/slab.h>
+#include <linux/stat.h>
 
 #include <linux/mmc/host.h>
 #include <linux/mmc/card.h>
@@ -84,12 +85,6 @@ void mmc_decode_cid(struct mmc_card *card)
 	card->cid.month			= UNSTUFF_BITS(resp, 8, 4);
 
 	card->cid.year += 2000; /* SD cards year offset */
-
-#ifdef CONFIG_MACH_JANICE_CHN
-	//FK27 dfl for I9070 SD card error issue	
-	pr_warning("%s: %s: manfid: 0x%02x, oemid: 0x%04x\n", __func__,
-	mmc_hostname(card->host), card->cid.manfid, card->cid.oemid);
-#endif
 }
 
 /*
@@ -365,13 +360,6 @@ out:
 	return err;
 }
 
-#ifdef CONFIG_MACH_JANICE_CHN
-//FK27 dfl for I9070 SD card error issue
-#define CID_MANFID_TRANSCEND  0x1B
-#define CID_OEMID_TRANSCEND 0x534D
-#define CID_NAME_TRANSCEND "00000"
-#endif
-
 /*
  * Test if the card supports high-speed mode and, if so, switch to it.
  */
@@ -391,21 +379,6 @@ int mmc_sd_switch_hs(struct mmc_card *card)
 
 	if (card->sw_caps.hs_max_dtr == 0)
 		return 0;
-
-#ifdef CONFIG_MACH_JANICE_CHN
-	//FK27 dfl for I9070 SD card error issue
-	/* 
-	 * Some cards display data crc error running on 50 Mhz,
-	 * so, disable high speed mode for them.
-	 */
-	if ((card->cid.manfid == CID_MANFID_TRANSCEND) &&
-			(card->cid.oemid == CID_OEMID_TRANSCEND) &&
-			!strcmp(mmc_card_name(card), CID_NAME_TRANSCEND)) {
-		pr_warning("%s: Trouble with high speed mode, disabling\n",
-			mmc_hostname(card->host));
-		return 0;
-	}
-#endif
 
 	err = -EIO;
 
@@ -1097,26 +1070,20 @@ static void mmc_sd_detect(struct mmc_host *host)
 {
 	int err = 0;
 #ifdef CONFIG_MMC_PARANOID_SD_INIT
-	int retries = 5;
-#endif
-
-#ifdef _MMC_SAFE_ACCESS_
-    int  slowcount = 100;
+        int retries = 5;
 #endif
 
 	BUG_ON(!host);
 	BUG_ON(!host->card);
-
+       
 	mmc_claim_host(host);
 
-/*
- * Just check if our card has been removed.
- */
-
-send_again:
+	/*
+	 * Just check if our card has been removed.
+	 */
 #ifdef CONFIG_MMC_PARANOID_SD_INIT
-	while (retries) {
-		err = _mmc_detect_card_removed(host);
+	while(retries) {
+		err = mmc_send_status(host->card, NULL);
 		if (err) {
 			retries--;
 			udelay(5);
@@ -1127,32 +1094,13 @@ send_again:
 	if (!retries) {
 		printk(KERN_ERR "%s(%s): Unable to re-detect card (%d)\n",
 		       __func__, mmc_hostname(host), err);
-	} else {
-#ifdef _MMC_SAFE_ACCESS_
-		slowcount = slowcount-4;
-#endif
 	}
 #else
 	err = _mmc_detect_card_removed(host);
 #endif
-
-#ifdef _MMC_SAFE_ACCESS_
-	slowcount--;
-	if ((mmc_is_available == 0) && (err == 0) && (slowcount != 0)) {
-/*wait 1s until sd card perfectly removed*/
-		mdelay(10);
-		goto send_again;
-		retries = 5;
-	}
-#endif
-
 	mmc_release_host(host);
 
-#ifdef _MMC_SAFE_ACCESS_
-    if (err || (slowcount == 0 && mmc_is_available == 0)) {
-#else
 	if (err) {
-#endif
 		mmc_sd_remove(host);
 
 		mmc_claim_host(host);

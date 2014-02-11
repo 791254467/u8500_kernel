@@ -144,46 +144,6 @@ static int ecryptfs_interpose(struct dentry *lower_dentry,
 }
 
 /**
- * ecryptfs_create_underlying_file
- * @lower_dir_inode: inode of the parent in the lower fs of the new file
- * @dentry: New file's dentry
- * @mode: The mode of the new file
- * @nd: nameidata of ecryptfs' parent's dentry & vfsmount
- *
- * Creates the file in the lower file system.
- *
- * Returns zero on success; non-zero on error condition
- */
-static int
-ecryptfs_create_underlying_file(struct inode *lower_dir_inode,
-				struct dentry *dentry, int mode,
-				struct nameidata *nd)
-{
-	struct dentry *lower_dentry = ecryptfs_dentry_to_lower(dentry);
-	struct vfsmount *lower_mnt = ecryptfs_dentry_to_lower_mnt(dentry);
-	struct dentry *dentry_save;
-	struct vfsmount *vfsmount_save;
-	unsigned int flags_save;
-	int rc;
-
-	if (nd) {
-		dentry_save = nd->path.dentry;
-		vfsmount_save = nd->path.mnt;
-		flags_save = nd->flags;
-		nd->path.dentry = lower_dentry;
-		nd->path.mnt = lower_mnt;
-		nd->flags &= ~LOOKUP_OPEN;
-	}
-	rc = vfs_create(lower_dir_inode, lower_dentry, mode, nd);
-	if (nd) {
-		nd->path.dentry = dentry_save;
-		nd->path.mnt = vfsmount_save;
-		nd->flags = flags_save;
-	}
-	return rc;
-}
-
-/**
  * ecryptfs_do_create
  * @directory_inode: inode of the new file's dentry's parent in ecryptfs
  * @ecryptfs_dentry: New file's dentry in ecryptfs
@@ -194,27 +154,26 @@ ecryptfs_create_underlying_file(struct inode *lower_dir_inode,
  * it. It will also update the eCryptfs directory inode to mimic the
  * stat of the lower directory inode.
  *
- * Returns zero on success; non-zero on error condition
+ * Returns the new eCryptfs inode on success; an ERR_PTR on error condition
  */
-static int
+static struct inode *
 ecryptfs_do_create(struct inode *directory_inode,
-		   struct dentry *ecryptfs_dentry, int mode,
-		   struct nameidata *nd)
+		   struct dentry *ecryptfs_dentry, umode_t mode)
 {
-	int inode, rc;
+	int rc;
 	struct dentry *lower_dentry;
 	struct dentry *lower_dir_dentry;
+	struct inode *inode;
 
 	lower_dentry = ecryptfs_dentry_to_lower(ecryptfs_dentry);
 	lower_dir_dentry = lock_parent(lower_dentry);
 	if (IS_ERR(lower_dir_dentry)) {
 		ecryptfs_printk(KERN_ERR, "Error locking directory of "
 				"dentry\n");
-		rc = PTR_ERR(lower_dir_dentry);
+		inode = ERR_CAST(lower_dir_dentry);
 		goto out;
 	}
-	rc = ecryptfs_create_underlying_file(lower_dir_dentry->d_inode,
-					     ecryptfs_dentry, mode, nd);
+	rc = vfs_create(lower_dir_dentry->d_inode, lower_dentry, mode, NULL);
 	if (rc) {
 		printk(KERN_ERR "%s: Failure to create dentry in lower fs; "
 		       "rc = [%d]\n", __func__, rc);
@@ -268,43 +227,10 @@ static int ecryptfs_initialize_file(struct dentry *ecryptfs_dentry,
 			ecryptfs_dentry->d_name.name, rc);
 		goto out;
 	}
-#ifdef CONFIG_WTL_ENCRYPTION_FILTER
-	mutex_lock(&crypt_stat->cs_mutex);
-	if (crypt_stat->flags & ECRYPTFS_ENCRYPTED) {
-		struct dentry *fp_dentry =
-			ecryptfs_inode_to_private(ecryptfs_dentry->d_inode)
-			->lower_file->f_dentry;
-		struct ecryptfs_mount_crypt_stat *mount_crypt_stat =
-			&ecryptfs_superblock_to_private(ecryptfs_dentry->d_sb)
-			->mount_crypt_stat;
-		char filename[NAME_MAX+1] = {0};
-		if (fp_dentry->d_name.len <= NAME_MAX)
-			memcpy(filename, fp_dentry->d_name.name,
-					fp_dentry->d_name.len + 1);
-
-		if ((mount_crypt_stat->flags & ECRYPTFS_ENABLE_NEW_PASSTHROUGH)
-		    || ((mount_crypt_stat->flags & ECRYPTFS_ENABLE_FILTERING) &&
-			(is_file_name_match(mount_crypt_stat, fp_dentry) ||
-			is_file_ext_match(mount_crypt_stat, filename)))) {
-			crypt_stat->flags &= ~(ECRYPTFS_I_SIZE_INITIALIZED
-					| ECRYPTFS_ENCRYPTED);
-			ecryptfs_put_lower_file(ecryptfs_dentry->d_inode);
-		} else {
-			rc = ecryptfs_write_metadata(ecryptfs_dentry, ecryptfs_inode);
-			if (rc)
-				printk(
-				KERN_ERR "Error writing headers; rc = [%d]\n"
-				    , rc);
-			ecryptfs_put_lower_file(ecryptfs_dentry->d_inode);
-		}
-	}
-	mutex_unlock(&crypt_stat->cs_mutex);
-#else
-	rc = ecryptfs_write_metadata(ecryptfs_dentry);
+	rc = ecryptfs_write_metadata(ecryptfs_dentry, ecryptfs_inode);
 	if (rc)
 		printk(KERN_ERR "Error writing headers; rc = [%d]\n", rc);
-	ecryptfs_put_lower_file(ecryptfs_dentry->d_inode);
-#endif
+	ecryptfs_put_lower_file(ecryptfs_inode);
 out:
 	return rc;
 }
@@ -322,20 +248,30 @@ out:
  */
 static int
 ecryptfs_create(struct inode *directory_inode, struct dentry *ecryptfs_dentry,
-		int mode, struct nameidata *nd, struct inode *ecryptfs_inode)
+		umode_t mode, struct nameidata *nd)
 {
+	struct inode *ecryptfs_inode;
 	int rc;
 
-	/* ecryptfs_do_create() calls ecryptfs_interpose() */
-	rc = ecryptfs_do_create(directory_inode, ecryptfs_dentry, mode, nd);
-	if (unlikely(rc)) {
+	ecryptfs_inode = ecryptfs_do_create(directory_inode, ecryptfs_dentry,
+					    mode);
+	if (unlikely(IS_ERR(ecryptfs_inode))) {
 		ecryptfs_printk(KERN_WARNING, "Failed to create file in"
 				"lower filesystem\n");
+		rc = PTR_ERR(ecryptfs_inode);
 		goto out;
 	}
 	/* At this point, a file exists on "disk"; we need to make sure
 	 * that this on disk file is prepared to be an ecryptfs file */
 	rc = ecryptfs_initialize_file(ecryptfs_dentry, ecryptfs_inode);
+	if (rc) {
+		drop_nlink(ecryptfs_inode);
+		unlock_new_inode(ecryptfs_inode);
+		iput(ecryptfs_inode);
+		goto out;
+	}
+	d_instantiate(ecryptfs_dentry, ecryptfs_inode);
+	unlock_new_inode(ecryptfs_inode);
 out:
 	return rc;
 }
@@ -529,8 +465,8 @@ static int ecryptfs_link(struct dentry *old_dentry, struct inode *dir,
 		goto out_lock;
 	fsstack_copy_attr_times(dir, lower_dir_dentry->d_inode);
 	fsstack_copy_inode_size(dir, lower_dir_dentry->d_inode);
-	old_dentry->d_inode->i_nlink =
-		ecryptfs_inode_to_lower(old_dentry->d_inode)->i_nlink;
+	set_nlink(old_dentry->d_inode,
+		  ecryptfs_inode_to_lower(old_dentry->d_inode)->i_nlink);
 	i_size_write(new_dentry->d_inode, file_size_save);
 out_lock:
 	unlock_dir(lower_dir_dentry);
@@ -554,8 +490,8 @@ static int ecryptfs_unlink(struct inode *dir, struct dentry *dentry)
 		goto out_unlock;
 	}
 	fsstack_copy_attr_times(dir, lower_dir_inode);
-	dentry->d_inode->i_nlink =
-		ecryptfs_inode_to_lower(dentry->d_inode)->i_nlink;
+	set_nlink(dentry->d_inode,
+		  ecryptfs_inode_to_lower(dentry->d_inode)->i_nlink);
 	dentry->d_inode->i_ctime = dir->i_ctime;
 	d_drop(dentry);
 out_unlock:
@@ -604,7 +540,7 @@ out_lock:
 	return rc;
 }
 
-static int ecryptfs_mkdir(struct inode *dir, struct dentry *dentry, int mode)
+static int ecryptfs_mkdir(struct inode *dir, struct dentry *dentry, umode_t mode)
 {
 	int rc;
 	struct dentry *lower_dentry;
@@ -620,7 +556,7 @@ static int ecryptfs_mkdir(struct inode *dir, struct dentry *dentry, int mode)
 		goto out;
 	fsstack_copy_attr_times(dir, lower_dir_dentry->d_inode);
 	fsstack_copy_inode_size(dir, lower_dir_dentry->d_inode);
-	dir->i_nlink = lower_dir_dentry->d_inode->i_nlink;
+	set_nlink(dir, lower_dir_dentry->d_inode->i_nlink);
 out:
 	unlock_dir(lower_dir_dentry);
 	if (!dentry->d_inode)
@@ -643,7 +579,7 @@ static int ecryptfs_rmdir(struct inode *dir, struct dentry *dentry)
 	if (!rc && dentry->d_inode)
 		clear_nlink(dentry->d_inode);
 	fsstack_copy_attr_times(dir, lower_dir_dentry->d_inode);
-	dir->i_nlink = lower_dir_dentry->d_inode->i_nlink;
+	set_nlink(dir, lower_dir_dentry->d_inode->i_nlink);
 	unlock_dir(lower_dir_dentry);
 	if (!rc)
 		d_drop(dentry);
@@ -652,7 +588,7 @@ static int ecryptfs_rmdir(struct inode *dir, struct dentry *dentry)
 }
 
 static int
-ecryptfs_mknod(struct inode *dir, struct dentry *dentry, int mode, dev_t dev)
+ecryptfs_mknod(struct inode *dir, struct dentry *dentry, umode_t mode, dev_t dev)
 {
 	int rc;
 	struct dentry *lower_dentry;
@@ -685,7 +621,6 @@ ecryptfs_rename(struct inode *old_dir, struct dentry *old_dentry,
 	struct dentry *lower_old_dir_dentry;
 	struct dentry *lower_new_dir_dentry;
 	struct dentry *trap = NULL;
-	struct inode *target_inode;
 
 	lower_old_dentry = ecryptfs_dentry_to_lower(old_dentry);
 	lower_new_dentry = ecryptfs_dentry_to_lower(new_dentry);
@@ -693,7 +628,6 @@ ecryptfs_rename(struct inode *old_dir, struct dentry *old_dentry,
 	dget(lower_new_dentry);
 	lower_old_dir_dentry = dget_parent(lower_old_dentry);
 	lower_new_dir_dentry = dget_parent(lower_new_dentry);
-	target_inode = new_dentry->d_inode;
 	trap = lock_rename(lower_old_dir_dentry, lower_new_dir_dentry);
 	/* source should not be ancestor of target */
 	if (trap == lower_old_dentry) {
@@ -709,9 +643,6 @@ ecryptfs_rename(struct inode *old_dir, struct dentry *old_dentry,
 			lower_new_dir_dentry->d_inode, lower_new_dentry);
 	if (rc)
 		goto out_lock;
-	if (target_inode)
-		fsstack_copy_attr_all(target_inode,
-				      ecryptfs_inode_to_lower(target_inode));
 	fsstack_copy_attr_all(new_dir, lower_new_dir_dentry->d_inode);
 	if (new_dir != old_dir)
 		fsstack_copy_attr_all(old_dir, lower_old_dir_dentry->d_inode);
@@ -891,18 +822,6 @@ static int truncate_upper(struct dentry *dentry, struct iattr *ia,
 		size_t num_zeros = (PAGE_CACHE_SIZE
 				    - (ia->ia_size & ~PAGE_CACHE_MASK));
 
-
-		/*
-		 * XXX(truncate) this should really happen at the begginning
-		 * of ->setattr.  But the code is too messy to that as part
-		 * of a larger patch.  ecryptfs is also totally missing out
-		 * on the inode_change_ok check at the beginning of
-		 * ->setattr while would include this.
-		 */
-		rc = inode_newsize_ok(inode, ia->ia_size);
-		if (rc)
-			goto out;
-
 		if (!(crypt_stat->flags & ECRYPTFS_ENCRYPTED)) {
 			truncate_setsize(inode, ia->ia_size);
 			lower_ia->ia_size = ia->ia_size;
@@ -952,6 +871,28 @@ out:
 	return rc;
 }
 
+static int ecryptfs_inode_newsize_ok(struct inode *inode, loff_t offset)
+{
+	struct ecryptfs_crypt_stat *crypt_stat;
+	loff_t lower_oldsize, lower_newsize;
+
+	crypt_stat = &ecryptfs_inode_to_private(inode)->crypt_stat;
+	lower_oldsize = upper_size_to_lower_size(crypt_stat,
+						 i_size_read(inode));
+	lower_newsize = upper_size_to_lower_size(crypt_stat, offset);
+	if (lower_newsize > lower_oldsize) {
+		/*
+		 * The eCryptfs inode and the new *lower* size are mixed here
+		 * because we may not have the lower i_mutex held and/or it may
+		 * not be appropriate to call inode_newsize_ok() with inodes
+		 * from other filesystems.
+		 */
+		return inode_newsize_ok(inode, lower_newsize);
+	}
+
+	return 0;
+}
+
 /**
  * ecryptfs_truncate
  * @dentry: The ecryptfs layer dentry
@@ -968,6 +909,10 @@ int ecryptfs_truncate(struct dentry *dentry, loff_t new_length)
 	struct iattr lower_ia = { .ia_valid = 0 };
 	int rc;
 
+	rc = ecryptfs_inode_newsize_ok(dentry->d_inode, new_length);
+	if (rc)
+		return rc;
+
 	rc = truncate_upper(dentry, &ia, &lower_ia);
 	if (!rc && lower_ia.ia_valid & ATTR_SIZE) {
 		struct dentry *lower_dentry = ecryptfs_dentry_to_lower(dentry);
@@ -980,10 +925,8 @@ int ecryptfs_truncate(struct dentry *dentry, loff_t new_length)
 }
 
 static int
-ecryptfs_permission(struct inode *inode, int mask, unsigned int flags)
+ecryptfs_permission(struct inode *inode, int mask)
 {
-	if (flags & IPERM_FLAG_RCU)
-		return -ECHILD;
 	return inode_permission(ecryptfs_inode_to_lower(inode), mask);
 }
 
@@ -1049,6 +992,16 @@ static int ecryptfs_setattr(struct dentry *dentry, struct iattr *ia)
 		}
 	}
 	mutex_unlock(&crypt_stat->cs_mutex);
+
+	rc = inode_change_ok(inode, ia);
+	if (rc)
+		goto out;
+	if (ia->ia_valid & ATTR_SIZE) {
+		rc = ecryptfs_inode_newsize_ok(inode, ia->ia_size);
+		if (rc)
+			goto out;
+	}
+
 	if (S_ISREG(inode->i_mode)) {
 		rc = filemap_write_and_wait(inode->i_mapping);
 		if (rc)
@@ -1132,6 +1085,8 @@ ecryptfs_setxattr(struct dentry *dentry, const char *name, const void *value,
 	}
 
 	rc = vfs_setxattr(lower_dentry, name, value, size, flags);
+	if (!rc)
+		fsstack_copy_attr_all(dentry->d_inode, lower_dentry->d_inode);
 out:
 	return rc;
 }

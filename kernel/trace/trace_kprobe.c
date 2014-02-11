@@ -343,6 +343,14 @@ DEFINE_BASIC_FETCH_FUNCS(deref)
 DEFINE_FETCH_deref(string)
 DEFINE_FETCH_deref(string_size)
 
+static __kprobes void update_deref_fetch_param(struct deref_fetch_param *data)
+{
+	if (CHECK_FETCH_FUNCS(deref, data->orig.fn))
+		update_deref_fetch_param(data->orig.data);
+	else if (CHECK_FETCH_FUNCS(symbol, data->orig.fn))
+		update_symbol_cache(data->orig.data);
+}
+
 static __kprobes void free_deref_fetch_param(struct deref_fetch_param *data)
 {
 	if (CHECK_FETCH_FUNCS(deref, data->orig.fn))
@@ -377,6 +385,19 @@ DEFINE_BASIC_FETCH_FUNCS(bitfield)
 #define fetch_bitfield_string_size NULL
 
 static __kprobes void
+update_bitfield_fetch_param(struct bitfield_fetch_param *data)
+{
+	/*
+	 * Don't check the bitfield itself, because this must be the
+	 * last fetch function.
+	 */
+	if (CHECK_FETCH_FUNCS(deref, data->orig.fn))
+		update_deref_fetch_param(data->orig.data);
+	else if (CHECK_FETCH_FUNCS(symbol, data->orig.fn))
+		update_symbol_cache(data->orig.data);
+}
+
+static __kprobes void
 free_bitfield_fetch_param(struct bitfield_fetch_param *data)
 {
 	/*
@@ -389,6 +410,7 @@ free_bitfield_fetch_param(struct bitfield_fetch_param *data)
 		free_symbol_cache(data->orig.data);
 	kfree(data);
 }
+
 /* Default (unsigned long) fetch type */
 #define __DEFAULT_FETCH_TYPE(t) u##t
 #define _DEFAULT_FETCH_TYPE(t) __DEFAULT_FETCH_TYPE(t)
@@ -556,12 +578,12 @@ struct trace_probe {
 	(sizeof(struct probe_arg) * (n)))
 
 
-static __kprobes int probe_is_return(struct trace_probe *tp)
+static __kprobes int trace_probe_is_return(struct trace_probe *tp)
 {
 	return tp->rp.handler != NULL;
 }
 
-static __kprobes const char *probe_symbol(struct trace_probe *tp)
+static __kprobes const char *trace_probe_symbol(struct trace_probe *tp)
 {
 	return tp->symbol ? tp->symbol : "unknown";
 }
@@ -680,6 +702,16 @@ error:
 	return ERR_PTR(ret);
 }
 
+static void update_probe_arg(struct probe_arg *arg)
+{
+	if (CHECK_FETCH_FUNCS(bitfield, arg->fetch.fn))
+		update_bitfield_fetch_param(arg->fetch.data);
+	else if (CHECK_FETCH_FUNCS(deref, arg->fetch.fn))
+		update_deref_fetch_param(arg->fetch.data);
+	else if (CHECK_FETCH_FUNCS(symbol, arg->fetch.fn))
+		update_symbol_cache(arg->fetch.data);
+}
+
 static void free_probe_arg(struct probe_arg *arg)
 {
 	if (CHECK_FETCH_FUNCS(bitfield, arg->fetch.fn))
@@ -705,7 +737,7 @@ static void free_trace_probe(struct trace_probe *tp)
 	kfree(tp);
 }
 
-static struct trace_probe *find_probe_event(const char *event,
+static struct trace_probe *find_trace_probe(const char *event,
 					    const char *group)
 {
 	struct trace_probe *tp;
@@ -717,13 +749,45 @@ static struct trace_probe *find_probe_event(const char *event,
 	return NULL;
 }
 
+/* Enable trace_probe - @flag must be TP_FLAG_TRACE or TP_FLAG_PROFILE */
+static int enable_trace_probe(struct trace_probe *tp, int flag)
+{
+	int ret = 0;
+
+	tp->flags |= flag;
+	if (trace_probe_is_enabled(tp) && trace_probe_is_registered(tp) &&
+	    !trace_probe_has_gone(tp)) {
+		if (trace_probe_is_return(tp))
+			ret = enable_kretprobe(&tp->rp);
+		else
+			ret = enable_kprobe(&tp->rp.kp);
+	}
+
+	return ret;
+}
+
+/* Disable trace_probe - @flag must be TP_FLAG_TRACE or TP_FLAG_PROFILE */
+static void disable_trace_probe(struct trace_probe *tp, int flag)
+{
+	tp->flags &= ~flag;
+	if (!trace_probe_is_enabled(tp) && trace_probe_is_registered(tp)) {
+		if (trace_probe_is_return(tp))
+			disable_kretprobe(&tp->rp);
+		else
+			disable_kprobe(&tp->rp.kp);
+	}
+}
+
 /* Internal register function - just handle k*probes and flags */
 static int __register_trace_probe(struct trace_probe *tp)
 {
-	int ret;
+	int i, ret;
 
 	if (trace_probe_is_registered(tp))
 		return -EINVAL;
+
+	for (i = 0; i < tp->nr_args; i++)
+		update_probe_arg(&tp->args[i]);
 
 	/* Set/clear disabled flag according to tp->flag */
 	if (trace_probe_is_enabled(tp))
@@ -731,7 +795,7 @@ static int __register_trace_probe(struct trace_probe *tp)
 	else
 		tp->rp.kp.flags |= KPROBE_FLAG_DISABLED;
 
-	if (probe_is_return(tp))
+	if (trace_probe_is_return(tp))
 		ret = register_kretprobe(&tp->rp);
 	else
 		ret = register_kprobe(&tp->rp.kp);
@@ -772,11 +836,17 @@ static void __unregister_trace_probe(struct trace_probe *tp)
 }
 
 /* Unregister a trace_probe and probe_event: call with locking probe_lock */
-static void unregister_trace_probe(struct trace_probe *tp)
+static int unregister_trace_probe(struct trace_probe *tp)
 {
+	/* Enabled event can not be unregistered */
+	if (trace_probe_is_enabled(tp))
+		return -EBUSY;
+
 	__unregister_trace_probe(tp);
 	list_del(&tp->list);
 	unregister_probe_event(tp);
+
+	return 0;
 }
 
 /* Register a trace_probe and probe_event */
@@ -788,9 +858,11 @@ static int register_trace_probe(struct trace_probe *tp)
 	mutex_lock(&probe_lock);
 
 	/* Delete old (same name) event if exist */
-	old_tp = find_probe_event(tp->call.name, tp->call.class->system);
+	old_tp = find_trace_probe(tp->call.name, tp->call.class->system);
 	if (old_tp) {
-		unregister_trace_probe(old_tp);
+		ret = unregister_trace_probe(old_tp);
+		if (ret < 0)
+			goto end;
 		free_trace_probe(old_tp);
 	}
 
@@ -828,6 +900,7 @@ static int trace_probe_module_callback(struct notifier_block *nb,
 	mutex_lock(&probe_lock);
 	list_for_each_entry(tp, &probe_list, list) {
 		if (trace_probe_within_module(tp, mod)) {
+			/* Don't need to check busy - this should have gone. */
 			__unregister_trace_probe(tp);
 			ret = __register_trace_probe(tp);
 			if (ret)
@@ -1134,17 +1207,18 @@ static int create_trace_probe(int argc, char **argv)
 			return -EINVAL;
 		}
 		mutex_lock(&probe_lock);
-		tp = find_probe_event(event, group);
+		tp = find_trace_probe(event, group);
 		if (!tp) {
 			mutex_unlock(&probe_lock);
 			pr_info("Event %s/%s doesn't exist.\n", group, event);
 			return -ENOENT;
 		}
 		/* delete an event */
-		unregister_trace_probe(tp);
-		free_trace_probe(tp);
+		ret = unregister_trace_probe(tp);
+		if (ret == 0)
+			free_trace_probe(tp);
 		mutex_unlock(&probe_lock);
-		return 0;
+		return ret;
 	}
 
 	if (argc < 2) {
@@ -1253,18 +1327,29 @@ error:
 	return ret;
 }
 
-static void cleanup_all_probes(void)
+static int release_all_trace_probes(void)
 {
 	struct trace_probe *tp;
+	int ret = 0;
 
 	mutex_lock(&probe_lock);
+	/* Ensure no probe is in use. */
+	list_for_each_entry(tp, &probe_list, list)
+		if (trace_probe_is_enabled(tp)) {
+			ret = -EBUSY;
+			goto end;
+		}
 	/* TODO: Use batch unregistration */
 	while (!list_empty(&probe_list)) {
 		tp = list_entry(probe_list.next, struct trace_probe, list);
 		unregister_trace_probe(tp);
 		free_trace_probe(tp);
 	}
+
+end:
 	mutex_unlock(&probe_lock);
+
+	return ret;
 }
 
 /* Probes listing interfaces */
@@ -1289,15 +1374,16 @@ static int probes_seq_show(struct seq_file *m, void *v)
 	struct trace_probe *tp = v;
 	int i;
 
-	seq_printf(m, "%c", probe_is_return(tp) ? 'r' : 'p');
+	seq_printf(m, "%c", trace_probe_is_return(tp) ? 'r' : 'p');
 	seq_printf(m, ":%s/%s", tp->call.class->system, tp->call.name);
 
 	if (!tp->symbol)
 		seq_printf(m, " 0x%p", tp->rp.kp.addr);
 	else if (tp->rp.kp.offset)
-		seq_printf(m, " %s+%u", probe_symbol(tp), tp->rp.kp.offset);
+		seq_printf(m, " %s+%u", trace_probe_symbol(tp),
+			   tp->rp.kp.offset);
 	else
-		seq_printf(m, " %s", probe_symbol(tp));
+		seq_printf(m, " %s", trace_probe_symbol(tp));
 
 	for (i = 0; i < tp->nr_args; i++)
 		seq_printf(m, " %s=%s", tp->args[i].name, tp->args[i].comm);
@@ -1315,9 +1401,13 @@ static const struct seq_operations probes_seq_op = {
 
 static int probes_open(struct inode *inode, struct file *file)
 {
-	if ((file->f_mode & FMODE_WRITE) &&
-	    (file->f_flags & O_TRUNC))
-		cleanup_all_probes();
+	int ret;
+
+	if ((file->f_mode & FMODE_WRITE) && (file->f_flags & O_TRUNC)) {
+		ret = release_all_trace_probes();
+		if (ret < 0)
+			return ret;
+	}
 
 	return seq_open(file, &probes_seq_op);
 }
@@ -1505,7 +1595,8 @@ static __kprobes void kprobe_trace_func(struct kprobe *kp, struct pt_regs *regs)
 	store_trace_args(sizeof(*entry), tp, regs, (u8 *)&entry[1], dsize);
 
 	if (!filter_current_check_discard(buffer, call, entry, event))
-		trace_nowake_buffer_unlock_commit(buffer, event, irq_flags, pc);
+		trace_nowake_buffer_unlock_commit_regs(buffer, event,
+						       irq_flags, pc, regs);
 }
 
 /* Kretprobe handler */
@@ -1537,7 +1628,8 @@ static __kprobes void kretprobe_trace_func(struct kretprobe_instance *ri,
 	store_trace_args(sizeof(*entry), tp, regs, (u8 *)&entry[1], dsize);
 
 	if (!filter_current_check_discard(buffer, call, entry, event))
-		trace_nowake_buffer_unlock_commit(buffer, event, irq_flags, pc);
+		trace_nowake_buffer_unlock_commit_regs(buffer, event,
+						       irq_flags, pc, regs);
 }
 
 /* Event entry printers */
@@ -1619,30 +1711,6 @@ partial:
 	return TRACE_TYPE_PARTIAL_LINE;
 }
 
-static int probe_event_enable(struct ftrace_event_call *call)
-{
-	struct trace_probe *tp = (struct trace_probe *)call->data;
-
-	tp->flags |= TP_FLAG_TRACE;
-	if (probe_is_return(tp))
-		return enable_kretprobe(&tp->rp);
-	else
-		return enable_kprobe(&tp->rp.kp);
-}
-
-static void probe_event_disable(struct ftrace_event_call *call)
-{
-	struct trace_probe *tp = (struct trace_probe *)call->data;
-
-	tp->flags &= ~TP_FLAG_TRACE;
-	if (!(tp->flags & (TP_FLAG_TRACE | TP_FLAG_PROFILE))) {
-		if (probe_is_return(tp))
-			disable_kretprobe(&tp->rp);
-		else
-			disable_kprobe(&tp->rp.kp);
-	}
-}
-
 #undef DEFINE_FIELD
 #define DEFINE_FIELD(type, item, name, is_signed)			\
 	do {								\
@@ -1704,7 +1772,7 @@ static int __set_print_fmt(struct trace_probe *tp, char *buf, int len)
 
 	const char *fmt, *arg;
 
-	if (!probe_is_return(tp)) {
+	if (!trace_probe_is_return(tp)) {
 		fmt = "(%lx)";
 		arg = "REC->" FIELD_STRING_IP;
 	} else {
@@ -1821,49 +1889,31 @@ static __kprobes void kretprobe_perf_func(struct kretprobe_instance *ri,
 	head = this_cpu_ptr(call->perf_events);
 	perf_trace_buf_submit(entry, size, rctx, entry->ret_ip, 1, regs, head);
 }
-
-static int probe_perf_enable(struct ftrace_event_call *call)
-{
-	struct trace_probe *tp = (struct trace_probe *)call->data;
-
-	tp->flags |= TP_FLAG_PROFILE;
-
-	if (probe_is_return(tp))
-		return enable_kretprobe(&tp->rp);
-	else
-		return enable_kprobe(&tp->rp.kp);
-}
-
-static void probe_perf_disable(struct ftrace_event_call *call)
-{
-	struct trace_probe *tp = (struct trace_probe *)call->data;
-
-	tp->flags &= ~TP_FLAG_PROFILE;
-
-	if (!(tp->flags & TP_FLAG_TRACE)) {
-		if (probe_is_return(tp))
-			disable_kretprobe(&tp->rp);
-		else
-			disable_kprobe(&tp->rp.kp);
-	}
-}
 #endif	/* CONFIG_PERF_EVENTS */
 
 static __kprobes
-int kprobe_register(struct ftrace_event_call *event, enum trace_reg type)
+int kprobe_register(struct ftrace_event_call *event,
+		    enum trace_reg type, void *data)
 {
+	struct trace_probe *tp = (struct trace_probe *)event->data;
+
 	switch (type) {
 	case TRACE_REG_REGISTER:
-		return probe_event_enable(event);
+		return enable_trace_probe(tp, TP_FLAG_TRACE);
 	case TRACE_REG_UNREGISTER:
-		probe_event_disable(event);
+		disable_trace_probe(tp, TP_FLAG_TRACE);
 		return 0;
 
 #ifdef CONFIG_PERF_EVENTS
 	case TRACE_REG_PERF_REGISTER:
-		return probe_perf_enable(event);
+		return enable_trace_probe(tp, TP_FLAG_PROFILE);
 	case TRACE_REG_PERF_UNREGISTER:
-		probe_perf_disable(event);
+		disable_trace_probe(tp, TP_FLAG_PROFILE);
+		return 0;
+	case TRACE_REG_PERF_OPEN:
+	case TRACE_REG_PERF_CLOSE:
+	case TRACE_REG_PERF_ADD:
+	case TRACE_REG_PERF_DEL:
 		return 0;
 #endif
 	}
@@ -1913,7 +1963,7 @@ static int register_probe_event(struct trace_probe *tp)
 
 	/* Initialize ftrace_event_call */
 	INIT_LIST_HEAD(&call->class->fields);
-	if (probe_is_return(tp)) {
+	if (trace_probe_is_return(tp)) {
 		call->event.funcs = &kretprobe_funcs;
 		call->class->define_fields = kretprobe_event_define_fields;
 	} else {
@@ -2008,12 +2058,12 @@ static __init int kprobe_trace_self_tests_init(void)
 		warn++;
 	} else {
 		/* Enable trace point */
-		tp = find_probe_event("testprobe", KPROBE_EVENT_SYSTEM);
+		tp = find_trace_probe("testprobe", KPROBE_EVENT_SYSTEM);
 		if (WARN_ON_ONCE(tp == NULL)) {
 			pr_warning("error on getting new probe.\n");
 			warn++;
 		} else
-			probe_event_enable(&tp->call);
+			enable_trace_probe(tp, TP_FLAG_TRACE);
 	}
 
 	ret = command_trace_probe("r:testprobe2 kprobe_trace_selftest_target "
@@ -2023,18 +2073,33 @@ static __init int kprobe_trace_self_tests_init(void)
 		warn++;
 	} else {
 		/* Enable trace point */
-		tp = find_probe_event("testprobe2", KPROBE_EVENT_SYSTEM);
+		tp = find_trace_probe("testprobe2", KPROBE_EVENT_SYSTEM);
 		if (WARN_ON_ONCE(tp == NULL)) {
 			pr_warning("error on getting new probe.\n");
 			warn++;
 		} else
-			probe_event_enable(&tp->call);
+			enable_trace_probe(tp, TP_FLAG_TRACE);
 	}
 
 	if (warn)
 		goto end;
 
 	ret = target(1, 2, 3, 4, 5, 6);
+
+	/* Disable trace points before removing it */
+	tp = find_trace_probe("testprobe", KPROBE_EVENT_SYSTEM);
+	if (WARN_ON_ONCE(tp == NULL)) {
+		pr_warning("error on getting test probe.\n");
+		warn++;
+	} else
+		disable_trace_probe(tp, TP_FLAG_TRACE);
+
+	tp = find_trace_probe("testprobe2", KPROBE_EVENT_SYSTEM);
+	if (WARN_ON_ONCE(tp == NULL)) {
+		pr_warning("error on getting 2nd test probe.\n");
+		warn++;
+	} else
+		disable_trace_probe(tp, TP_FLAG_TRACE);
 
 	ret = command_trace_probe("-:testprobe");
 	if (WARN_ON_ONCE(ret)) {
@@ -2049,7 +2114,7 @@ static __init int kprobe_trace_self_tests_init(void)
 	}
 
 end:
-	cleanup_all_probes();
+	release_all_trace_probes();
 	if (warn)
 		pr_cont("NG: Some tests are failed. Please check them.\n");
 	else

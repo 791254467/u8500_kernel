@@ -219,7 +219,7 @@ static struct platform_device dma40_device = {
 	.dev = {
 		.platform_data = &dma40_plat_data,
 #ifdef CONFIG_PM
-		.pwr_domain = &ux500_dev_power_domain,
+		.pm_domain = &ux500_dev_power_domain,
 #endif
 	},
 	.name		= "dma40",
@@ -228,10 +228,11 @@ static struct platform_device dma40_device = {
 	.resource	= dma40_resources
 };
 
-void __init db5500_dma_init(void)
+void __init db5500_dma_init(struct device *parent)
 {
 	int ret;
 
+	dma40_device.dev.parent = parent;
 	ret = platform_device_register(&dma40_device);
 	if (ret)
 		dev_err(&dma40_device.dev, "unable to register device: %d\n",

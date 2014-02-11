@@ -17,6 +17,7 @@
 #include <linux/dma-mapping.h>
 #include <linux/dmaengine.h>
 #include <linux/dma-mapping.h>
+#include <linux/module.h>
 #include <linux/slab.h>
 #include <linux/workqueue.h>
 
@@ -36,8 +37,7 @@ static struct snd_pcm_hardware ux500_pcm_hw_playback = {
 	.formats = SNDRV_PCM_FMTBIT_S16_LE |
 		SNDRV_PCM_FMTBIT_U16_LE |
 		SNDRV_PCM_FMTBIT_S16_BE |
-		SNDRV_PCM_FMTBIT_U16_BE |
-		SNDRV_PCM_FMTBIT_S32_LE,
+		SNDRV_PCM_FMTBIT_U16_BE,
 	.rates = SNDRV_PCM_RATE_KNOT,
 	.rate_min = UX500_PLATFORM_MIN_RATE_PLAYBACK,
 	.rate_max = UX500_PLATFORM_MAX_RATE_PLAYBACK,
@@ -58,8 +58,7 @@ static struct snd_pcm_hardware ux500_pcm_hw_capture = {
 	.formats = SNDRV_PCM_FMTBIT_S16_LE |
 		SNDRV_PCM_FMTBIT_U16_LE |
 		SNDRV_PCM_FMTBIT_S16_BE |
-		SNDRV_PCM_FMTBIT_U16_BE |
-		SNDRV_PCM_FMTBIT_S32_LE,
+		SNDRV_PCM_FMTBIT_U16_BE,
 	.rates = SNDRV_PCM_RATE_KNOT,
 	.rate_min = UX500_PLATFORM_MIN_RATE_CAPTURE,
 	.rate_max = UX500_PLATFORM_MAX_RATE_CAPTURE,
@@ -139,7 +138,8 @@ ux500_pcm_dma_start(
 		dma_addr,
 		period_cnt * period_len,
 		period_len,
-		direction);
+		direction,
+		NULL);
 
 	if (IS_ERR(cdesc)) {
 		pr_err("%s: ERROR: device_prep_dma_cyclic failed (%ld)!\n",
@@ -349,16 +349,7 @@ ux500_pcm_prepare(struct snd_pcm_substream *substream)
 
 	dma_params = snd_soc_dai_get_dma_data(dai, substream);
 
-	switch (runtime->sample_bits) {
-	case 32:
-		mem_data_width = STEDMA40_WORD_WIDTH;
-		break;
-
-	case 16:
-	default:
-		mem_data_width = STEDMA40_HALFWORD_WIDTH;
-		break;
-	}
+	mem_data_width = STEDMA40_HALFWORD_WIDTH;
 
 	switch (dma_params->data_size) {
 	case 32:
@@ -374,7 +365,6 @@ ux500_pcm_prepare(struct snd_pcm_substream *substream)
 		per_data_width = STEDMA40_WORD_WIDTH;
 		pr_warn("%s: Unknown data-size (%d)! Assuming 32 bits.\n",
 			__func__, dma_params->data_size);
-		break;
 	}
 
 	dma_cfg = dma_params->dma_cfg;
@@ -484,10 +474,10 @@ static struct snd_pcm_ops ux500_pcm_ops = {
 	.mmap		= ux500_pcm_mmap
 };
 
-int ux500_pcm_new(struct snd_card *card,
-		struct snd_soc_dai *dai,
-		struct snd_pcm *pcm)
+int ux500_pcm_new(struct snd_soc_pcm_runtime *rtd)
 {
+	struct snd_pcm *pcm = rtd->pcm;
+
 	pr_debug("%s: pcm = %d\n", __func__, (int)pcm);
 
 	pcm->info_flags = 0;

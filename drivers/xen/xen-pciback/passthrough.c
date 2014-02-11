@@ -7,25 +7,25 @@
 
 #include <linux/list.h>
 #include <linux/pci.h>
-#include <linux/spinlock.h>
+#include <linux/mutex.h>
 #include "pciback.h"
 
 struct passthrough_dev_data {
 	/* Access to dev_list must be protected by lock */
 	struct list_head dev_list;
-	spinlock_t lock;
+	struct mutex lock;
 };
 
-struct pci_dev *pciback_get_pci_dev(struct pciback_device *pdev,
-				    unsigned int domain, unsigned int bus,
-				    unsigned int devfn)
+static struct pci_dev *__xen_pcibk_get_pci_dev(struct xen_pcibk_device *pdev,
+					       unsigned int domain,
+					       unsigned int bus,
+					       unsigned int devfn)
 {
 	struct passthrough_dev_data *dev_data = pdev->pci_dev_data;
 	struct pci_dev_entry *dev_entry;
 	struct pci_dev *dev = NULL;
-	unsigned long flags;
 
-	spin_lock_irqsave(&dev_data->lock, flags);
+	mutex_lock(&dev_data->lock);
 
 	list_for_each_entry(dev_entry, &dev_data->dev_list, list) {
 		if (domain == (unsigned int)pci_domain_nr(dev_entry->dev->bus)
@@ -36,17 +36,17 @@ struct pci_dev *pciback_get_pci_dev(struct pciback_device *pdev,
 		}
 	}
 
-	spin_unlock_irqrestore(&dev_data->lock, flags);
+	mutex_unlock(&dev_data->lock);
 
 	return dev;
 }
 
-int pciback_add_pci_dev(struct pciback_device *pdev, struct pci_dev *dev,
-			int devid, publish_pci_dev_cb publish_cb)
+static int __xen_pcibk_add_pci_dev(struct xen_pcibk_device *pdev,
+				   struct pci_dev *dev,
+				   int devid, publish_pci_dev_cb publish_cb)
 {
 	struct passthrough_dev_data *dev_data = pdev->pci_dev_data;
 	struct pci_dev_entry *dev_entry;
-	unsigned long flags;
 	unsigned int domain, bus, devfn;
 	int err;
 
@@ -55,9 +55,9 @@ int pciback_add_pci_dev(struct pciback_device *pdev, struct pci_dev *dev,
 		return -ENOMEM;
 	dev_entry->dev = dev;
 
-	spin_lock_irqsave(&dev_data->lock, flags);
+	mutex_lock(&dev_data->lock);
 	list_add_tail(&dev_entry->list, &dev_data->dev_list);
-	spin_unlock_irqrestore(&dev_data->lock, flags);
+	mutex_unlock(&dev_data->lock);
 
 	/* Publish this device. */
 	domain = (unsigned int)pci_domain_nr(dev->bus);
@@ -68,14 +68,14 @@ int pciback_add_pci_dev(struct pciback_device *pdev, struct pci_dev *dev,
 	return err;
 }
 
-void pciback_release_pci_dev(struct pciback_device *pdev, struct pci_dev *dev)
+static void __xen_pcibk_release_pci_dev(struct xen_pcibk_device *pdev,
+					struct pci_dev *dev)
 {
 	struct passthrough_dev_data *dev_data = pdev->pci_dev_data;
 	struct pci_dev_entry *dev_entry, *t;
 	struct pci_dev *found_dev = NULL;
-	unsigned long flags;
 
-	spin_lock_irqsave(&dev_data->lock, flags);
+	mutex_lock(&dev_data->lock);
 
 	list_for_each_entry_safe(dev_entry, t, &dev_data->dev_list, list) {
 		if (dev_entry->dev == dev) {
@@ -85,13 +85,13 @@ void pciback_release_pci_dev(struct pciback_device *pdev, struct pci_dev *dev)
 		}
 	}
 
-	spin_unlock_irqrestore(&dev_data->lock, flags);
+	mutex_unlock(&dev_data->lock);
 
 	if (found_dev)
 		pcistub_put_pci_dev(found_dev);
 }
 
-int pciback_init_devices(struct pciback_device *pdev)
+static int __xen_pcibk_init_devices(struct xen_pcibk_device *pdev)
 {
 	struct passthrough_dev_data *dev_data;
 
@@ -99,7 +99,7 @@ int pciback_init_devices(struct pciback_device *pdev)
 	if (!dev_data)
 		return -ENOMEM;
 
-	spin_lock_init(&dev_data->lock);
+	mutex_init(&dev_data->lock);
 
 	INIT_LIST_HEAD(&dev_data->dev_list);
 
@@ -108,8 +108,8 @@ int pciback_init_devices(struct pciback_device *pdev)
 	return 0;
 }
 
-int pciback_publish_pci_roots(struct pciback_device *pdev,
-			      publish_pci_root_cb publish_root_cb)
+static int __xen_pcibk_publish_pci_roots(struct xen_pcibk_device *pdev,
+					 publish_pci_root_cb publish_root_cb)
 {
 	int err = 0;
 	struct passthrough_dev_data *dev_data = pdev->pci_dev_data;
@@ -118,7 +118,7 @@ int pciback_publish_pci_roots(struct pciback_device *pdev,
 	int found;
 	unsigned int domain, bus;
 
-	spin_lock(&dev_data->lock);
+	mutex_lock(&dev_data->lock);
 
 	list_for_each_entry(dev_entry, &dev_data->dev_list, list) {
 		/* Only publish this device as a root if none of its
@@ -145,12 +145,12 @@ int pciback_publish_pci_roots(struct pciback_device *pdev,
 		}
 	}
 
-	spin_unlock(&dev_data->lock);
+	mutex_unlock(&dev_data->lock);
 
 	return err;
 }
 
-void pciback_release_devices(struct pciback_device *pdev)
+static void __xen_pcibk_release_devices(struct xen_pcibk_device *pdev)
 {
 	struct passthrough_dev_data *dev_data = pdev->pci_dev_data;
 	struct pci_dev_entry *dev_entry, *t;
@@ -165,14 +165,24 @@ void pciback_release_devices(struct pciback_device *pdev)
 	pdev->pci_dev_data = NULL;
 }
 
-int pciback_get_pcifront_dev(struct pci_dev *pcidev,
-			     struct pciback_device *pdev,
-			     unsigned int *domain, unsigned int *bus,
-			     unsigned int *devfn)
-
+static int __xen_pcibk_get_pcifront_dev(struct pci_dev *pcidev,
+					struct xen_pcibk_device *pdev,
+					unsigned int *domain, unsigned int *bus,
+					unsigned int *devfn)
 {
 	*domain = pci_domain_nr(pcidev->bus);
 	*bus = pcidev->bus->number;
 	*devfn = pcidev->devfn;
 	return 1;
 }
+
+const struct xen_pcibk_backend xen_pcibk_passthrough_backend = {
+	.name           = "passthrough",
+	.init           = __xen_pcibk_init_devices,
+	.free		= __xen_pcibk_release_devices,
+	.find           = __xen_pcibk_get_pcifront_dev,
+	.publish        = __xen_pcibk_publish_pci_roots,
+	.release        = __xen_pcibk_release_pci_dev,
+	.add            = __xen_pcibk_add_pci_dev,
+	.get            = __xen_pcibk_get_pci_dev,
+};

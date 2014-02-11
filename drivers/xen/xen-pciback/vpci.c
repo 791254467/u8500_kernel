@@ -8,7 +8,7 @@
 #include <linux/list.h>
 #include <linux/slab.h>
 #include <linux/pci.h>
-#include <linux/spinlock.h>
+#include <linux/mutex.h>
 #include "pciback.h"
 
 #define PCI_SLOT_MAX 32
@@ -16,7 +16,7 @@
 struct vpci_dev_data {
 	/* Access to dev_list must be protected by lock */
 	struct list_head dev_list[PCI_SLOT_MAX];
-	spinlock_t lock;
+	struct mutex lock;
 };
 
 static inline struct list_head *list_first(struct list_head *head)
@@ -24,20 +24,20 @@ static inline struct list_head *list_first(struct list_head *head)
 	return head->next;
 }
 
-struct pci_dev *pciback_get_pci_dev(struct pciback_device *pdev,
-				    unsigned int domain, unsigned int bus,
-				    unsigned int devfn)
+static struct pci_dev *__xen_pcibk_get_pci_dev(struct xen_pcibk_device *pdev,
+					       unsigned int domain,
+					       unsigned int bus,
+					       unsigned int devfn)
 {
 	struct pci_dev_entry *entry;
 	struct pci_dev *dev = NULL;
 	struct vpci_dev_data *vpci_dev = pdev->pci_dev_data;
-	unsigned long flags;
 
 	if (domain != 0 || bus != 0)
 		return NULL;
 
 	if (PCI_SLOT(devfn) < PCI_SLOT_MAX) {
-		spin_lock_irqsave(&vpci_dev->lock, flags);
+		mutex_lock(&vpci_dev->lock);
 
 		list_for_each_entry(entry,
 				    &vpci_dev->dev_list[PCI_SLOT(devfn)],
@@ -48,7 +48,7 @@ struct pci_dev *pciback_get_pci_dev(struct pciback_device *pdev,
 			}
 		}
 
-		spin_unlock_irqrestore(&vpci_dev->lock, flags);
+		mutex_unlock(&vpci_dev->lock);
 	}
 	return dev;
 }
@@ -62,13 +62,13 @@ static inline int match_slot(struct pci_dev *l, struct pci_dev *r)
 	return 0;
 }
 
-int pciback_add_pci_dev(struct pciback_device *pdev, struct pci_dev *dev,
-			int devid, publish_pci_dev_cb publish_cb)
+static int __xen_pcibk_add_pci_dev(struct xen_pcibk_device *pdev,
+				   struct pci_dev *dev, int devid,
+				   publish_pci_dev_cb publish_cb)
 {
 	int err = 0, slot, func = -1;
 	struct pci_dev_entry *t, *dev_entry;
 	struct vpci_dev_data *vpci_dev = pdev->pci_dev_data;
-	unsigned long flags;
 
 	if ((dev->class >> 24) == PCI_BASE_CLASS_BRIDGE) {
 		err = -EFAULT;
@@ -87,7 +87,7 @@ int pciback_add_pci_dev(struct pciback_device *pdev, struct pci_dev *dev,
 
 	dev_entry->dev = dev;
 
-	spin_lock_irqsave(&vpci_dev->lock, flags);
+	mutex_lock(&vpci_dev->lock);
 
 	/* Keep multi-function devices together on the virtual PCI bus */
 	for (slot = 0; slot < PCI_SLOT_MAX; slot++) {
@@ -96,7 +96,7 @@ int pciback_add_pci_dev(struct pciback_device *pdev, struct pci_dev *dev,
 				       struct pci_dev_entry, list);
 
 			if (match_slot(dev, t->dev)) {
-				pr_info("pciback: vpci: %s: "
+				pr_info(DRV_NAME ": vpci: %s: "
 					"assign to virtual slot %d func %d\n",
 					pci_name(dev), slot,
 					PCI_FUNC(dev->devfn));
@@ -111,8 +111,8 @@ int pciback_add_pci_dev(struct pciback_device *pdev, struct pci_dev *dev,
 	/* Assign to a new slot on the virtual PCI bus */
 	for (slot = 0; slot < PCI_SLOT_MAX; slot++) {
 		if (list_empty(&vpci_dev->dev_list[slot])) {
-			printk(KERN_INFO
-			       "pciback: vpci: %s: assign to virtual slot %d\n",
+			printk(KERN_INFO DRV_NAME
+			       ": vpci: %s: assign to virtual slot %d\n",
 			       pci_name(dev), slot);
 			list_add_tail(&dev_entry->list,
 				      &vpci_dev->dev_list[slot]);
@@ -126,7 +126,7 @@ int pciback_add_pci_dev(struct pciback_device *pdev, struct pci_dev *dev,
 			 "No more space on root virtual PCI bus");
 
 unlock:
-	spin_unlock_irqrestore(&vpci_dev->lock, flags);
+	mutex_unlock(&vpci_dev->lock);
 
 	/* Publish this device. */
 	if (!err)
@@ -136,19 +136,19 @@ out:
 	return err;
 }
 
-void pciback_release_pci_dev(struct pciback_device *pdev, struct pci_dev *dev)
+static void __xen_pcibk_release_pci_dev(struct xen_pcibk_device *pdev,
+					struct pci_dev *dev)
 {
 	int slot;
 	struct vpci_dev_data *vpci_dev = pdev->pci_dev_data;
 	struct pci_dev *found_dev = NULL;
-	unsigned long flags;
 
-	spin_lock_irqsave(&vpci_dev->lock, flags);
+	mutex_lock(&vpci_dev->lock);
 
 	for (slot = 0; slot < PCI_SLOT_MAX; slot++) {
-		struct pci_dev_entry *e, *tmp;
-		list_for_each_entry_safe(e, tmp, &vpci_dev->dev_list[slot],
-					 list) {
+		struct pci_dev_entry *e;
+
+		list_for_each_entry(e, &vpci_dev->dev_list[slot], list) {
 			if (e->dev == dev) {
 				list_del(&e->list);
 				found_dev = e->dev;
@@ -159,13 +159,13 @@ void pciback_release_pci_dev(struct pciback_device *pdev, struct pci_dev *dev)
 	}
 
 out:
-	spin_unlock_irqrestore(&vpci_dev->lock, flags);
+	mutex_unlock(&vpci_dev->lock);
 
 	if (found_dev)
 		pcistub_put_pci_dev(found_dev);
 }
 
-int pciback_init_devices(struct pciback_device *pdev)
+static int __xen_pcibk_init_devices(struct xen_pcibk_device *pdev)
 {
 	int slot;
 	struct vpci_dev_data *vpci_dev;
@@ -174,7 +174,7 @@ int pciback_init_devices(struct pciback_device *pdev)
 	if (!vpci_dev)
 		return -ENOMEM;
 
-	spin_lock_init(&vpci_dev->lock);
+	mutex_init(&vpci_dev->lock);
 
 	for (slot = 0; slot < PCI_SLOT_MAX; slot++)
 		INIT_LIST_HEAD(&vpci_dev->dev_list[slot]);
@@ -184,14 +184,14 @@ int pciback_init_devices(struct pciback_device *pdev)
 	return 0;
 }
 
-int pciback_publish_pci_roots(struct pciback_device *pdev,
-			      publish_pci_root_cb publish_cb)
+static int __xen_pcibk_publish_pci_roots(struct xen_pcibk_device *pdev,
+					 publish_pci_root_cb publish_cb)
 {
 	/* The Virtual PCI bus has only one root */
 	return publish_cb(pdev, 0, 0);
 }
 
-void pciback_release_devices(struct pciback_device *pdev)
+static void __xen_pcibk_release_devices(struct xen_pcibk_device *pdev)
 {
 	int slot;
 	struct vpci_dev_data *vpci_dev = pdev->pci_dev_data;
@@ -210,18 +210,17 @@ void pciback_release_devices(struct pciback_device *pdev)
 	pdev->pci_dev_data = NULL;
 }
 
-int pciback_get_pcifront_dev(struct pci_dev *pcidev,
-			     struct pciback_device *pdev,
-			     unsigned int *domain, unsigned int *bus,
-			     unsigned int *devfn)
+static int __xen_pcibk_get_pcifront_dev(struct pci_dev *pcidev,
+					struct xen_pcibk_device *pdev,
+					unsigned int *domain, unsigned int *bus,
+					unsigned int *devfn)
 {
 	struct pci_dev_entry *entry;
 	struct pci_dev *dev = NULL;
 	struct vpci_dev_data *vpci_dev = pdev->pci_dev_data;
-	unsigned long flags;
 	int found = 0, slot;
 
-	spin_lock_irqsave(&vpci_dev->lock, flags);
+	mutex_lock(&vpci_dev->lock);
 	for (slot = 0; slot < PCI_SLOT_MAX; slot++) {
 		list_for_each_entry(entry,
 			    &vpci_dev->dev_list[slot],
@@ -239,6 +238,17 @@ int pciback_get_pcifront_dev(struct pci_dev *pcidev,
 			}
 		}
 	}
-	spin_unlock_irqrestore(&vpci_dev->lock, flags);
+	mutex_unlock(&vpci_dev->lock);
 	return found;
 }
+
+const struct xen_pcibk_backend xen_pcibk_vpci_backend = {
+	.name		= "vpci",
+	.init		= __xen_pcibk_init_devices,
+	.free		= __xen_pcibk_release_devices,
+	.find		= __xen_pcibk_get_pcifront_dev,
+	.publish	= __xen_pcibk_publish_pci_roots,
+	.release	= __xen_pcibk_release_pci_dev,
+	.add		= __xen_pcibk_add_pci_dev,
+	.get		= __xen_pcibk_get_pci_dev,
+};

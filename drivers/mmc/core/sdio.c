@@ -10,6 +10,7 @@
  */
 
 #include <linux/err.h>
+#include <linux/module.h>
 #include <linux/pm_runtime.h>
 
 #include <linux/mmc/host.h>
@@ -589,7 +590,6 @@ static int mmc_sdio_init_card(struct mmc_host *host, u32 ocr,
 	 * Inform the card of the voltage
 	 */
 	if (!powered_resume) {
-
 		/* The initialization should be done at 3.3 V I/O voltage. */
 		mmc_set_signal_voltage(host, MMC_SIGNAL_VOLTAGE_330, 0);
 
@@ -726,7 +726,7 @@ static int mmc_sdio_init_card(struct mmc_host *host, u32 ocr,
 		/*
 		 * Read the common registers.
 		 */
-		err = sdio_read_cccr(card, ocr);
+		err = sdio_read_cccr(card,  ocr);
 		if (err)
 			goto remove;
 #ifdef CONFIG_MMC_EMBEDDED_SDIO
@@ -968,7 +968,7 @@ static int mmc_sdio_resume(struct mmc_host *host)
 	}
 
 	if (!err && host->sdio_irqs)
-		wake_up_process(host->sdio_irq_thread);
+		mmc_signal_sdio_irq(host);
 	mmc_release_host(host);
 
 	/*
@@ -1021,8 +1021,8 @@ static int mmc_sdio_power_restore(struct mmc_host *host)
 	 * restore the correct voltage setting of the card.
 	 */
 
+	/* The initialization should be done at 3.3 V I/O voltage. */
 	if (!mmc_card_keep_power(host))
-		/* The initialization should be done at 3.3 V I/O voltage. */
 		mmc_set_signal_voltage(host, MMC_SIGNAL_VOLTAGE_330, 0);
 
 	sdio_reset(host);

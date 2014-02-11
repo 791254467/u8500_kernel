@@ -16,7 +16,7 @@
 #include <linux/kernel.h>
 #include <linux/mfd/dbx500-prcmu.h>
 #include <linux/cpu.h>
-#include <linux/pm_qos_params.h>
+#include <linux/pm_qos.h>
 
 #include <mach/irqs.h>
 
@@ -51,7 +51,7 @@ static struct delayed_work work_mmc;
 #endif
 
 static struct delayed_work work_wlan_workaround;
-static struct pm_qos_request_list wlan_pm_qos_latency;
+static struct pm_qos_request wlan_pm_qos_latency;
 static bool wlan_pm_qos_is_latency_0;
 
 static void wlan_load(struct work_struct *work)
@@ -65,15 +65,8 @@ static void wlan_load(struct work_struct *work)
 
 	if ((num_irqs > old_num_irqs) &&
 	    (num_irqs - old_num_irqs) > WLAN_LIMIT) {
-		prcmu_qos_update_requirement(PRCMU_QOS_ARM_KHZ,
-					     "wlan",
-					     PRCMU_QOS_MAX_VALUE);
-		prcmu_qos_update_requirement(PRCMU_QOS_APE_OPP,
-					     "wlan",
-					     PRCMU_QOS_MAX_VALUE);
-		prcmu_qos_update_requirement(PRCMU_QOS_DDR_OPP,
-					     "wlan",
-					     PRCMU_QOS_MAX_VALUE);
+		prcmu_qos_update_requirement(PRCMU_QOS_ARM_OPP,
+					     "wlan", 125);
 		if (!wlan_pm_qos_is_latency_0) {
 			/*
 			 * The wake up latency is set to 0 to prevent
@@ -89,15 +82,8 @@ static void wlan_load(struct work_struct *work)
 			wlan_pm_qos_is_latency_0 = true;
 		}
 	} else {
-		prcmu_qos_update_requirement(PRCMU_QOS_ARM_KHZ,
-					     "wlan",
-					     PRCMU_QOS_DEFAULT_VALUE);
-		prcmu_qos_update_requirement(PRCMU_QOS_APE_OPP,
-					     "wlan",
-					     PRCMU_QOS_DEFAULT_VALUE);
-		prcmu_qos_update_requirement(PRCMU_QOS_DDR_OPP,
-					     "wlan",
-					     PRCMU_QOS_DEFAULT_VALUE);
+		prcmu_qos_update_requirement(PRCMU_QOS_ARM_OPP,
+					     "wlan", 25);
 		if (wlan_pm_qos_is_latency_0) {
 			pm_qos_remove_request(&wlan_pm_qos_latency);
 			wlan_pm_qos_is_latency_0 = false;
@@ -188,29 +174,13 @@ static void mmc_load(struct work_struct *work)
 		old_sectors_written[i] = sectors;
 	}
 
-	if (!old_mode && new_mode) {
-		prcmu_qos_update_requirement(PRCMU_QOS_ARM_KHZ,
-					     "mmc",
-					     PRCMU_QOS_MAX_VALUE);
-		prcmu_qos_update_requirement(PRCMU_QOS_APE_OPP,
-					     "mmc",
-					     PRCMU_QOS_MAX_VALUE);
-		prcmu_qos_update_requirement(PRCMU_QOS_DDR_OPP,
-					     "mmc",
-					     PRCMU_QOS_MAX_VALUE);
-	}
+	if (!old_mode && new_mode)
+		prcmu_qos_update_requirement(PRCMU_QOS_ARM_OPP,
+						"mmc", 125);
 
-	if (old_mode && !new_mode) {
-		prcmu_qos_update_requirement(PRCMU_QOS_ARM_KHZ,
-					     "mmc",
-					     PRCMU_QOS_DEFAULT_VALUE);
-		prcmu_qos_update_requirement(PRCMU_QOS_APE_OPP,
-					     "mmc",
-					     PRCMU_QOS_DEFAULT_VALUE);
-		prcmu_qos_update_requirement(PRCMU_QOS_DDR_OPP,
-					     "mmc",
-					     PRCMU_QOS_DEFAULT_VALUE);
-	}
+	if (old_mode && !new_mode)
+		prcmu_qos_update_requirement(PRCMU_QOS_ARM_OPP,
+						"mmc", 25);
 
 	old_mode = new_mode;
 
@@ -222,50 +192,33 @@ static void mmc_load(struct work_struct *work)
 
 static int __init performance_register(void)
 {
-	int ret_mmc;
-	int ret_wlan;
+	int ret;
 
 #ifdef CONFIG_MMC_BLOCK
-	ret_mmc = prcmu_qos_add_requirement(PRCMU_QOS_ARM_KHZ, "mmc",
-					    PRCMU_QOS_DEFAULT_VALUE);
-	if (!ret_mmc)
-		ret_mmc = prcmu_qos_add_requirement(PRCMU_QOS_APE_OPP, "mmc",
-						    PRCMU_QOS_DEFAULT_VALUE);
-	if (!ret_mmc)
-		ret_mmc = prcmu_qos_add_requirement(PRCMU_QOS_DDR_OPP, "mmc",
-						    PRCMU_QOS_DEFAULT_VALUE);
-	if (ret_mmc) {
-		pr_err("%s: Failed to add PRCMU QoS req for mmc\n", __func__);
-		prcmu_qos_remove_requirement(PRCMU_QOS_ARM_KHZ, "mmc");
-		prcmu_qos_remove_requirement(PRCMU_QOS_APE_OPP, "mmc");
-		prcmu_qos_remove_requirement(PRCMU_QOS_DDR_OPP, "mmc");
-	} else {
-		INIT_DELAYED_WORK_DEFERRABLE(&work_mmc, mmc_load);
-		schedule_delayed_work(&work_mmc,
-				      msecs_to_jiffies(PERF_MMC_PROBE_DELAY));
+	ret = prcmu_qos_add_requirement(PRCMU_QOS_ARM_OPP, "mmc", 25);
+	if (ret) {
+		pr_err("%s: Failed to add PRCMU req for mmc\n", __func__);
+		goto out;
 	}
+
+	INIT_DELAYED_WORK_DEFERRABLE(&work_mmc, mmc_load);
+
+	schedule_delayed_work(&work_mmc,
+				 msecs_to_jiffies(PERF_MMC_PROBE_DELAY));
 #endif
 
-	ret_wlan = prcmu_qos_add_requirement(PRCMU_QOS_ARM_KHZ, "wlan",
-					     PRCMU_QOS_DEFAULT_VALUE);
-	if (!ret_wlan)
-		ret_wlan = prcmu_qos_add_requirement(PRCMU_QOS_APE_OPP, "wlan",
-						     PRCMU_QOS_DEFAULT_VALUE);
-	if (!ret_wlan)
-		ret_wlan = prcmu_qos_add_requirement(PRCMU_QOS_DDR_OPP, "wlan",
-						     PRCMU_QOS_DEFAULT_VALUE);
-	if (ret_wlan) {
-		pr_err("%s: Failed to add PRCMU QoS req for wlan\n", __func__);
-		prcmu_qos_remove_requirement(PRCMU_QOS_ARM_KHZ, "wlan");
-		prcmu_qos_remove_requirement(PRCMU_QOS_APE_OPP, "wlan");
-		prcmu_qos_remove_requirement(PRCMU_QOS_DDR_OPP, "wlan");
-	} else {
-		INIT_DELAYED_WORK_DEFERRABLE(&work_wlan_workaround, wlan_load);
-		schedule_delayed_work_on(0, &work_wlan_workaround,
-					 msecs_to_jiffies(WLAN_PROBE_DELAY));
+	ret = prcmu_qos_add_requirement(PRCMU_QOS_ARM_OPP, "wlan", 25);
+	if (ret) {
+		pr_err("%s: Failed to add PRCMU req for wlan\n", __func__);
+		goto out;
 	}
 
-	/* Only return one error code */
-	return ret_mmc ? ret_mmc : ret_wlan;
+	INIT_DELAYED_WORK_DEFERRABLE(&work_wlan_workaround,
+				     wlan_load);
+
+	schedule_delayed_work_on(0, &work_wlan_workaround,
+			       msecs_to_jiffies(WLAN_PROBE_DELAY));
+out:
+	return ret;
 }
 late_initcall(performance_register);

@@ -20,11 +20,12 @@
 #include <linux/device.h>
 #include <linux/gpio.h>
 #include <linux/irq.h>
+#include <linux/interrupt.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/platform_device.h>
 #include <linux/pm.h>
-#include <linux/pm_qos_params.h>
+#include <linux/pm_qos.h>
 #include <linux/poll.h>
 #include <linux/sched.h>
 #include <linux/skbuff.h>
@@ -56,8 +57,8 @@
 #define HCI_BT_CMD_COMPLETE_LEN	(sizeof(struct hci_ev_cmd_complete) + 1)
 
 /* Timers used in milliseconds */
-#define UART_TX_TIMEOUT		100
-#define UART_RX_TIMEOUT		20
+#define UART_TX_TIMEOUT		10
+#define UART_RX_TIMEOUT		10
 #define UART_RESP_TIMEOUT	1000
 #define UART_RESUME_TIMEOUT	20
 /* Minimum time host should maintain the break */
@@ -81,11 +82,8 @@
 #define HCI_BT_EVT_HDR_SIZE	2
 #define HCI_BT_ACL_HDR_SIZE	4
 #define HCI_NFC_HDR_SIZE	3
-#define HCI_ANT_CMD_HDR_SIZE	1
-#define HCI_ANT_DAT_HDR_SIZE	1
 #define HCI_FM_RADIO_HDR_SIZE	1
 #define HCI_GNSS_HDR_SIZE	3
-#define HCI_DEV_MGMT_HDR_SIZE	2
 
 /* Position of length field in the different packets */
 #define HCI_EVT_LEN_POS		2
@@ -96,7 +94,7 @@
 /* Baud rate defines */
 #define ZERO_BAUD_RATE		0
 #define DEFAULT_BAUD_RATE	115200
-#define HIGH_BAUD_RATE		3250000
+#define HIGH_BAUD_RATE		3000000
 
 #define BT_SIZE_OF_HDR				(sizeof(__le16) + sizeof(__u8))
 #define BT_PARAM_LEN(__pkt_len)			(__pkt_len - BT_SIZE_OF_HDR)
@@ -107,8 +105,6 @@
 #define HCI_BT_SCO_H4_CHANNEL			0x03
 #define HCI_BT_EVT_H4_CHANNEL			0x04
 
-#define HCI_DEV_MGMT_H4_CHANNEL			0x80
-
 #define BT_BDADDR_SIZE				6
 
 /* Reserve 1 byte for the HCI H:4 header */
@@ -117,12 +113,8 @@
 
 /* Default H4 channels which may change depending on connected controller */
 #define HCI_NFC_H4_CHANNEL			0x05
-#define HCI_ANT_CMD_H4_CHANNEL			0x0C
-#define HCI_ANT_DAT_H4_CHANNEL			0x0E
 #define HCI_FM_RADIO_H4_CHANNEL			0x08
 #define HCI_GNSS_H4_CHANNEL			0x09
-#define HCI_DEBUG_H4_CHANNEL			0x0B
-#define HCI_DEV_MGMT_CHANNEL_BIT	0x80
 
 /* Bluetooth error codes */
 #define HCI_BT_ERROR_NO_ERROR			0x00
@@ -137,8 +129,6 @@
 #define CG2900_BAUD_RATE_3000000			0x27
 #define CG2900_BAUD_RATE_3250000			0x28
 #define CG2900_BAUD_RATE_4000000			0x2B
-#define CG2900_BAUD_RATE_4050000			0x59
-#define CG2900_BAUD_RATE_4800000			0x5A
 
 /* NFC: 1byte extra is recieved for checksum */
 #define NFC_CHECKSUM_DATA_LEN			0x01
@@ -147,16 +137,6 @@
 struct nfc_hci_hdr {
 	__u8	op_code;
 	__le16	plen;
-} __packed;
-
-/* ANT COMMAND HEADER */
-struct ant_cmd_hci_hdr {
-	__u8	plen;
-} __packed;
-
-/* ANT DATA HEADER */
-struct ant_dat_hci_hdr {
-	__u8	plen;
 } __packed;
 
 /**
@@ -241,10 +221,7 @@ struct bt_vs_set_baud_rate_cmd {
  * @W4_EVENT_HDR:	Waiting for BT event header.
  * @W4_ACL_HDR:		Waiting for BT ACL header.
  * @W4_NFC_HDR:		Waiting for NFC header.
- * @W4_ANT_CMD_HDR:	Waiting for ANT command header.
- * @W4_ANT_DAT_HDR:	Waiting for ANT data header.
  * @W4_FM_RADIO_HDR:	Waiting for FM header.
- * @W4_DBG_HDR:		Waiting for Debug header.
  * @W4_GNSS_HDR:	Waiting for GNSS header.
  * @W4_DATA:		Waiting for data in rest of the packet (after header).
  */
@@ -253,12 +230,8 @@ enum uart_rx_state {
 	W4_EVENT_HDR,
 	W4_ACL_HDR,
 	W4_NFC_HDR,
-	W4_ANT_CMD_HDR,
-	W4_ANT_DAT_HDR,
 	W4_FM_RADIO_HDR,
 	W4_GNSS_HDR,
-	W4_DBG_HDR,
-	W4_DEV_MGMT_HDR,
 	W4_DATA
 };
 
@@ -385,7 +358,7 @@ struct uart_info {
 	int				cts_gpio;
 	struct wake_lock		wake_lock;
 	bool				suspend_blocked;
-	struct pm_qos_request_list	pm_qos_latency;
+	struct pm_qos_request		pm_qos_latency;
 };
 
 /* Module parameters */
@@ -715,15 +688,6 @@ static void wake_up_chip(struct uart_info *uart_info)
 
 		/* Set FLOW on. */
 		hci_uart_flow_ctrl(uart_info->hu, FLOW_ON);
-
-		/*
-		 * Add work so we will go to sleep, this will ensure
-		 * if some spurious CTS interrupt comes from UART
-		 * on wake up line, we go back to sleep.
-		 */
-		if (uart_info->rx_in_progress)
-			(void)queue_work(uart_info->wq,
-				&uart_info->restart_sleep_work.work);
 	}
 
 	/* Unset BREAK. */
@@ -777,11 +741,6 @@ static void set_chip_sleep_mode(struct work_struct *work)
 		if (!is_chip_flow_off(uart_info)) {
 			dev_dbg(MAIN_DEV, "Chip flow is on, it's not ready to"
 				"sleep yet\n");
-			hci_uart_set_break(uart_info->hu, BREAK_OFF);
-			udelay(UART_MIN_BREAK_OFF_TIME);
-
-			dev_dbg(MAIN_DEV, "New sleep_state: CHIP_AWAKE\n");
-			uart_info->sleep_state = CHIP_AWAKE;
 			goto schedule_sleep_work;
 		}
 
@@ -997,6 +956,9 @@ static bool is_set_baud_rate_cmd(const char *data)
 {
 	struct hci_command_hdr *cmd;
 
+	if (data[0] != HCI_BT_CMD_H4_CHANNEL)
+		return false;
+
 	cmd = (struct hci_command_hdr *)&data[1];
 	if (le16_to_cpu(cmd->opcode) == CG2900_BT_OP_VS_SET_BAUD_RATE &&
 	    cmd->plen == BT_PARAM_LEN(sizeof(struct bt_vs_set_baud_rate_cmd)))
@@ -1016,13 +978,13 @@ static bool is_set_baud_rate_cmd(const char *data)
  *   false - otherwise.
  */
 static bool is_bt_cmd_complete_no_param(struct sk_buff *skb, u16 opcode,
-					u8 *status, u8 h4_channel)
+					u8 *status)
 {
 	struct hci_event_hdr *event;
 	struct hci_ev_cmd_complete *complete;
 	u8 *data = &(skb->data[0]);
 
-	if (h4_channel != *data)
+	if (HCI_BT_EVT_H4_CHANNEL != *data)
 		return false;
 
 	data += HCI_H4_SIZE;
@@ -1161,12 +1123,6 @@ static struct sk_buff *alloc_set_baud_rate_cmd(struct uart_info *uart_info,
 	case 4000000:
 		cmd->baud_rate = CG2900_BAUD_RATE_4000000;
 		break;
-	case 4050000:
-		cmd->baud_rate = CG2900_BAUD_RATE_4050000;
-		break;
-	case 4800000:
-		cmd->baud_rate = CG2900_BAUD_RATE_4800000;
-		break;
 	default:
 		dev_err(MAIN_DEV,
 			"Invalid speed requested (%d), using 115200 bps "
@@ -1177,12 +1133,7 @@ static struct sk_buff *alloc_set_baud_rate_cmd(struct uart_info *uart_info,
 	};
 
 	h4 = skb_push(skb, HCI_H4_SIZE);
-	if (use_device_channel_for_vs_cmd(
-			uart_info->chip_dev.chip.hci_revision)) {
-		*h4 = HCI_DEV_MGMT_H4_CHANNEL;
-	} else {
-		*h4 = HCI_BT_CMD_H4_CHANNEL;
-	}
+	*h4 = HCI_BT_CMD_H4_CHANNEL;
 
 	return skb;
 }
@@ -1398,9 +1349,6 @@ static int uart_write(struct cg2900_chip_dev *dev, struct sk_buff *skb)
 	int err;
 	struct uart_info *uart_info = dev_get_drvdata(dev->dev);
 
-	if (!uart_info->hu)
-		return -EACCES;
-
 	if (uart_debug)
 		dev_dbg(MAIN_DEV, "uart_write: data len = %d\n", skb->len);
 
@@ -1499,9 +1447,8 @@ static int uart_open(struct cg2900_chip_dev *dev)
 		 * after firmware d/l UART will be switched
 		 * to higher baud.
 		 */
-		if (CG2905_PG1_05_REV != dev->chip.hci_revision &&
-				CG2910_PG1_REV != dev->chip.hci_revision &&
-				CG2910_PG1_05_REV != dev->chip.hci_revision)
+		if (CG2905_PG1_1_REV != dev->chip.hci_revision &&
+				CG2910_PG1_REV != dev->chip.hci_revision)
 			return set_baud_rate(uart_info->hu, uart_high_baud);
 	}
 
@@ -1528,12 +1475,12 @@ static void uart_set_chip_power(struct cg2900_chip_dev *dev, bool chip_on)
 	cancel_work_sync(&uart_info->wakeup_work.work);
 	cancel_delayed_work_sync(&uart_info->sleep_work.work);
 
+	mutex_lock(&uart_info->sleep_state_lock);
+
 	if (!uart_info->hu) {
 		dev_err(MAIN_DEV, "Hci uart struct is not allocated\n");
-		return;
+		goto unlock;
 	}
-
-	mutex_lock(&uart_info->sleep_state_lock);
 
 	if (chip_on) {
 		if (!uart_info->suspend_blocked) {
@@ -1576,10 +1523,6 @@ static void uart_set_chip_power(struct cg2900_chip_dev *dev, bool chip_on)
 			unset_cts_irq(uart_info);
 			enable_uart_pins(uart_info);
 			break;
-		case CHIP_POWERED_DOWN:
-			dev_err(MAIN_DEV, "Chip is already powered down (%d)\n",
-					uart_info->sleep_state);
-			goto unlock;
 		default:
 			break;
 		}
@@ -1689,14 +1632,8 @@ static void send_skb_to_core(struct uart_info *uart_info, struct sk_buff *skb)
 		 * the CmdComplete for the SetBaudrate command
 		 * Let's see if this is the packet we are waiting for.
 		 */
-		u8 h4_channel = HCI_BT_EVT_H4_CHANNEL;
-		if (use_device_channel_for_vs_cmd(
-				uart_info->chip_dev.chip.hci_revision)) {
-			h4_channel = HCI_DEV_MGMT_H4_CHANNEL;
-		}
 		if (!is_bt_cmd_complete_no_param(skb,
-				CG2900_BT_OP_VS_SET_BAUD_RATE, &status,
-				h4_channel)) {
+				CG2900_BT_OP_VS_SET_BAUD_RATE, &status)) {
 			/*
 			 * Received other event. Should not really happen,
 			 * but pass the data to CG2900 Core anyway.
@@ -1733,8 +1670,7 @@ static void send_skb_to_core(struct uart_info *uart_info, struct sk_buff *skb)
 		 * the CmdComplete for the Reset command
 		 * Let's see if this is the packet we are waiting for.
 		 */
-		if (!is_bt_cmd_complete_no_param(skb, HCI_OP_RESET, &status,
-				HCI_BT_EVT_H4_CHANNEL)) {
+		if (!is_bt_cmd_complete_no_param(skb, HCI_OP_RESET, &status)) {
 			/*
 			 * Received other event. Should not really happen,
 			 * but pass the data to CG2900 Core anyway.
@@ -1859,8 +1795,6 @@ static int cg2900_hu_receive(struct hci_uart *hu,
 	struct hci_event_hdr	*evt;
 	struct hci_acl_hdr	*acl;
 	struct nfc_hci_hdr	*nfc;
-	struct ant_cmd_hci_hdr	*ant_cmd;
-	struct ant_dat_hci_hdr	*ant_dat;
 	union fm_leg_evt_or_irq	*fm;
 	struct gnss_hci_hdr	*gnss;
 	struct uart_info *uart_info = dev_get_drvdata(hu->proto->dev);
@@ -1920,7 +1854,6 @@ static int cg2900_hu_receive(struct hci_uart *hu,
 			uart_info->rx_skb = NULL;
 			continue;
 
-		case W4_DBG_HDR:
 		case W4_EVENT_HDR:
 			evt = (struct hci_event_hdr *)tmp;
 			check_data_len(uart_info, evt->plen);
@@ -1947,18 +1880,6 @@ static int cg2900_hu_receive(struct hci_uart *hu,
 			/* Header read. Continue with next bytes */
 			continue;
 
-		case W4_ANT_CMD_HDR:
-			ant_cmd = (struct ant_cmd_hci_hdr *)tmp;
-			check_data_len(uart_info, ant_cmd->plen);
-			/* Header read. Continue with next bytes */
-			continue;
-
-		case W4_ANT_DAT_HDR:
-			ant_dat = (struct ant_dat_hci_hdr *)tmp;
-			check_data_len(uart_info, ant_dat->plen);
-			/* Header read. Continue with next bytes */
-			continue;
-
 		case W4_FM_RADIO_HDR:
 			fm = (union fm_leg_evt_or_irq *)tmp;
 			check_data_len(uart_info, fm->param_length);
@@ -1968,16 +1889,6 @@ static int cg2900_hu_receive(struct hci_uart *hu,
 		case W4_GNSS_HDR:
 			gnss = (struct gnss_hci_hdr *)tmp;
 			check_data_len(uart_info, le16_to_cpu(gnss->plen));
-			/* Header read. Continue with next bytes */
-			continue;
-
-		case W4_DEV_MGMT_HDR:
-			/*
-			 * Device management events are similar to
-			 * BT HCI Header
-			 */
-			evt = (struct hci_event_hdr *)tmp;
-			check_data_len(uart_info, evt->plen);
 			/* Header read. Continue with next bytes */
 			continue;
 
@@ -1999,24 +1910,12 @@ check_h4_header:
 		} else if (*r_ptr == HCI_NFC_H4_CHANNEL) {
 			uart_info->rx_state = W4_NFC_HDR;
 			uart_info->rx_count = HCI_NFC_HDR_SIZE;
-		} else if (*r_ptr == HCI_ANT_CMD_H4_CHANNEL) {
-			uart_info->rx_state = W4_ANT_CMD_HDR;
-			uart_info->rx_count = HCI_ANT_CMD_HDR_SIZE;
-		} else if (*r_ptr == HCI_ANT_DAT_H4_CHANNEL) {
-			uart_info->rx_state = W4_ANT_DAT_HDR;
-			uart_info->rx_count = HCI_ANT_DAT_HDR_SIZE;
 		} else if (*r_ptr == HCI_FM_RADIO_H4_CHANNEL) {
 			uart_info->rx_state = W4_FM_RADIO_HDR;
 			uart_info->rx_count = HCI_FM_RADIO_HDR_SIZE;
 		} else if (*r_ptr == HCI_GNSS_H4_CHANNEL) {
 			uart_info->rx_state = W4_GNSS_HDR;
 			uart_info->rx_count = HCI_GNSS_HDR_SIZE;
-		} else if (*r_ptr == HCI_DEBUG_H4_CHANNEL) {
-			uart_info->rx_state = W4_DBG_HDR;
-			uart_info->rx_count = HCI_BT_EVT_HDR_SIZE;
-		} else if (*r_ptr & HCI_DEV_MGMT_CHANNEL_BIT) {
-			uart_info->rx_state = W4_DEV_MGMT_HDR;
-			uart_info->rx_count = HCI_DEV_MGMT_HDR_SIZE;
 		} else {
 			dev_err(MAIN_DEV, "Unknown HCI packet type 0x%X\n",
 				(u8)*r_ptr);
@@ -2110,6 +2009,7 @@ static int cg2900_hu_close(struct hci_uart *hu)
 	int err;
 	struct uart_info *uart_info = dev_get_drvdata(hu->proto->dev);
 
+
 	BUG_ON(!uart_info);
 	BUG_ON(!uart_info->wq);
 
@@ -2118,16 +2018,20 @@ static int cg2900_hu_close(struct hci_uart *hu)
 	/* Purge any stored sk_buffers */
 	skb_queue_purge(&uart_info->tx_queue);
 
-	/* Power off the chip. */
-	uart_set_chip_power(&uart_info->chip_dev, false);
+	spin_lock_bh(&uart_info->rx_skb_lock);
+	if (uart_info->rx_skb) {
+		kfree_skb(uart_info->rx_skb);
+		uart_info->rx_skb = NULL;
+	}
+	spin_unlock_bh(&uart_info->rx_skb_lock);
 
 	dev_info(MAIN_DEV, "UART closed\n");
-	uart_info->hu = NULL;
-
 	err = create_work_item(uart_info, work_hw_deregistered);
 	if (err)
 		dev_err(MAIN_DEV, "Failed to create work item (%d) "
 			"work_hw_deregistered\n", err);
+
+	uart_info->hu = NULL;
 
 	return 0;
 }
@@ -2144,8 +2048,9 @@ static struct sk_buff *cg2900_hu_dequeue(struct hci_uart *hu)
 	struct sk_buff *skb;
 	struct uart_info *uart_info = dev_get_drvdata(hu->proto->dev);
 	unsigned long timeout_jiffies = get_sleep_timeout(uart_info);
+	unsigned long flags;
 
-	spin_lock_bh(&(uart_info->transmission_lock));
+	spin_lock_irqsave(&(uart_info->transmission_lock), flags);
 
 	skb = skb_dequeue(&uart_info->tx_queue);
 
@@ -2160,7 +2065,7 @@ static struct sk_buff *cg2900_hu_dequeue(struct hci_uart *hu)
 				&uart_info->sleep_work.work,
 				timeout_jiffies);
 
-	spin_unlock_bh(&(uart_info->transmission_lock));
+	spin_unlock_irqrestore(&(uart_info->transmission_lock), flags);
 
 	if (BAUD_SENDING == uart_info->baud_rate_state && !skb)
 		finish_setting_baud_rate(hu);
@@ -2315,7 +2220,6 @@ static int __devinit cg2900_uart_probe(struct platform_device *pdev)
 error_handling_wq:
 	destroy_workqueue(uart_info->wq);
 error_handling_free:
-	wake_lock_destroy(&uart_info->wake_lock);
 	kfree(uart_info);
 	uart_info = NULL;
 finished:

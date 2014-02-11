@@ -51,7 +51,6 @@
 #define VERSION "0.409"
 
 #include <asm/uaccess.h>
-#include <asm/system.h>
 #include <linux/bitops.h>
 #include <linux/types.h>
 #include <linux/kernel.h>
@@ -72,6 +71,8 @@
 #include <linux/init.h>
 #include <linux/list.h>
 #include <linux/slab.h>
+#include <linux/prefetch.h>
+#include <linux/export.h>
 #include <net/net_namespace.h>
 #include <net/ip.h>
 #include <net/protocol.h>
@@ -1168,9 +1169,8 @@ static struct list_head *fib_insert_node(struct trie *t, u32 key, int plen)
 	}
 
 	if (tp && tp->pos + tp->bits > 32)
-		pr_warning("fib_trie"
-			   " tp=%p pos=%d, bits=%d, key=%0x plen=%d\n",
-			   tp, tp->pos, tp->bits, key, plen);
+		pr_warn("fib_trie tp=%p pos=%d, bits=%d, key=%0x plen=%d\n",
+			tp, tp->pos, tp->bits, key, plen);
 
 	/* Rebalance the trie */
 
@@ -1607,6 +1607,7 @@ found:
 	rcu_read_unlock();
 	return ret;
 }
+EXPORT_SYMBOL_GPL(fib_table_lookup);
 
 /*
  * Remove the leaf and return parent.
@@ -1622,7 +1623,7 @@ static void trie_leaf_remove(struct trie *t, struct leaf *l)
 		put_child(t, (struct tnode *)tp, cindex, NULL);
 		trie_rebalance(t, tp);
 	} else
-		rcu_assign_pointer(t->trie, NULL);
+		RCU_INIT_POINTER(t->trie, NULL);
 
 	free_leaf(l);
 }
@@ -1771,8 +1772,10 @@ static struct leaf *leaf_walk_rcu(struct tnode *p, struct rt_trie_node *c)
 			if (!c)
 				continue;
 
-			if (IS_LEAF(c))
+			if (IS_LEAF(c)) {
+				prefetch(rcu_dereference_rtnl(p->child[idx]));
 				return (struct leaf *) c;
+			}
 
 			/* Rescan start scanning in new node */
 			p = (struct tnode *) c;

@@ -99,7 +99,6 @@
 /* Extended status bits for the ST Micro variants */
 #define MCI_ST_SDIOIT		(1 << 22)
 #define MCI_ST_CEATAEND		(1 << 23)
-#define MCI_ST_CARDBUSY		(1 << 24)
 
 #define MMCICLEAR		0x038
 #define MCI_CMDCRCFAILCLR	(1 << 0)
@@ -116,7 +115,6 @@
 /* Extended status bits for the ST Micro variants */
 #define MCI_ST_SDIOITC		(1 << 22)
 #define MCI_ST_CEATAENDC	(1 << 23)
-#define MCI_ST_BUSYENDC		(1 << 24)
 
 #define MMCIMASK0		0x03c
 #define MCI_CMDCRCFAILMASK	(1 << 0)
@@ -213,7 +211,6 @@ struct mmci_host {
 	struct dma_chan		*dma_tx_channel;
 	struct dma_async_tx_descriptor	*dma_desc_current;
 	struct mmci_host_next	next_data;
-	bool			dma_was_disabled;
 
 #define dma_inprogress(host)	((host)->dma_current)
 #else

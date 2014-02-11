@@ -24,6 +24,7 @@
 #include <linux/if_arp.h>
 #include <linux/if_tun.h>
 #include <linux/if_macvlan.h>
+#include <linux/if_vlan.h>
 
 #include <net/sock.h>
 
@@ -182,15 +183,21 @@ static void handle_tx(struct vhost_net *net)
 			break;
 		/* Nothing new?  Wait for eventfd to tell us they refilled. */
 		if (head == vq->num) {
+			int num_pends;
+
 			wmem = atomic_read(&sock->sk->sk_wmem_alloc);
 			if (wmem >= sock->sk->sk_sndbuf * 3 / 4) {
 				tx_poll_start(net, sock);
 				set_bit(SOCK_ASYNC_NOSPACE, &sock->flags);
 				break;
 			}
-			/* If more outstanding DMAs, queue the work */
-			if (unlikely(vq->upend_idx - vq->done_idx >
-				     VHOST_MAX_PEND)) {
+			/* If more outstanding DMAs, queue the work.
+			 * Handle upend_idx wrap around
+			 */
+			num_pends = likely(vq->upend_idx >= vq->done_idx) ?
+				    (vq->upend_idx - vq->done_idx) :
+				    (vq->upend_idx + UIO_MAXIOV - vq->done_idx);
+			if (unlikely(num_pends > VHOST_MAX_PEND)) {
 				tx_poll_start(net, sock);
 				set_bit(SOCK_ASYNC_NOSPACE, &sock->flags);
 				break;
@@ -232,7 +239,7 @@ static void handle_tx(struct vhost_net *net)
 
 				vq->heads[vq->upend_idx].len = len;
 				ubuf->callback = vhost_zerocopy_callback;
-				ubuf->arg = vq->ubufs;
+				ubuf->ctx = vq->ubufs;
 				ubuf->desc = vq->upend_idx;
 				msg.msg_control = ubuf;
 				msg.msg_controllen = sizeof(ubuf);
@@ -277,8 +284,12 @@ static int peek_head_len(struct sock *sk)
 
 	spin_lock_irqsave(&sk->sk_receive_queue.lock, flags);
 	head = skb_peek(&sk->sk_receive_queue);
-	if (likely(head))
+	if (likely(head)) {
 		len = head->len;
+		if (vlan_tx_tag_present(head))
+			len += VLAN_HLEN;
+	}
+
 	spin_unlock_irqrestore(&sk->sk_receive_queue.lock, flags);
 	return len;
 }
@@ -365,8 +376,7 @@ static void handle_rx(struct vhost_net *net)
 		.hdr.gso_type = VIRTIO_NET_HDR_GSO_NONE
 	};
 	size_t total_len = 0;
-	int err, mergeable;
-	s16 headcount;
+	int err, headcount, mergeable;
 	size_t vhost_hlen, sock_hlen;
 	size_t vhost_len, sock_len;
 	/* TODO: check that we are running from vhost_worker? */
@@ -583,7 +593,7 @@ static int vhost_net_release(struct inode *inode, struct file *f)
 
 	vhost_net_stop(n, &tx_sock, &rx_sock);
 	vhost_net_flush(n);
-	vhost_dev_cleanup(&n->dev);
+	vhost_dev_cleanup(&n->dev, false);
 	if (tx_sock)
 		fput(tx_sock->file);
 	if (rx_sock)
@@ -704,12 +714,20 @@ static long vhost_net_set_backend(struct vhost_net *n, unsigned index, int fd)
 		vhost_net_disable_vq(n, vq);
 		rcu_assign_pointer(vq->private_data, sock);
 		vhost_net_enable_vq(n, vq);
+
+		r = vhost_init_used(vq);
+		if (r)
+			goto err_vq;
 	}
 
 	mutex_unlock(&vq->mutex);
 
-	if (oldubufs)
+	if (oldubufs) {
 		vhost_ubuf_put_and_wait(oldubufs);
+		mutex_lock(&vq->mutex);
+		vhost_zerocopy_signal_used(vq);
+		mutex_unlock(&vq->mutex);
+	}
 
 	if (oldsock) {
 		vhost_net_flush_vq(n, index);
@@ -843,9 +861,9 @@ static const struct file_operations vhost_net_fops = {
 };
 
 static struct miscdevice vhost_net_misc = {
-	MISC_DYNAMIC_MINOR,
-	"vhost-net",
-	&vhost_net_fops,
+	.minor = VHOST_NET_MINOR,
+	.name = "vhost-net",
+	.fops = &vhost_net_fops,
 };
 
 static int vhost_net_init(void)
@@ -866,3 +884,5 @@ MODULE_VERSION("0.0.1");
 MODULE_LICENSE("GPL v2");
 MODULE_AUTHOR("Michael S. Tsirkin");
 MODULE_DESCRIPTION("Host kernel accelerator for virtio net");
+MODULE_ALIAS_MISCDEV(VHOST_NET_MINOR);
+MODULE_ALIAS("devname:vhost-net");

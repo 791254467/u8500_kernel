@@ -36,10 +36,9 @@ bool ux500_pm_gic_pending_interrupt(void);
 /**
  * ux500_pm_prcmu_pending_interrupt()
  *
- * returns true, if there are pending interrupts and the
- * number of the pending interrupt.
+ * returns true, if there are pending interrupts.
  */
-bool ux500_pm_prcmu_pending_interrupt(u32 *pending_irq);
+bool ux500_pm_prcmu_pending_interrupt(void);
 
 /**
  * ux500_pm_prcmu_set_ioforce()
@@ -84,9 +83,9 @@ u32 ux500_pm_gpio_read_wake_up_status(unsigned int bank_number);
  */
 bool ux500_pm_other_cpu_wfi(void);
 
-struct dev_power_domain;
-extern struct dev_power_domain ux500_dev_power_domain;
-extern struct dev_power_domain ux500_amba_dev_power_domain;
+struct dev_pm_domain;
+extern struct dev_pm_domain ux500_dev_power_domain;
+extern struct dev_pm_domain ux500_amba_dev_power_domain;
 
 #else
 u32 ux500_pm_gpio_read_wake_up_status(unsigned int bank_number)

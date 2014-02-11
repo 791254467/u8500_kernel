@@ -545,13 +545,13 @@ int iscsi_copy_param_list(
 	struct iscsi_param_list *src_param_list,
 	int leading)
 {
-	struct iscsi_param *new_param = NULL, *param = NULL;
+	struct iscsi_param *param = NULL;
+	struct iscsi_param *new_param = NULL;
 	struct iscsi_param_list *param_list = NULL;
 
 	param_list = kzalloc(sizeof(struct iscsi_param_list), GFP_KERNEL);
 	if (!param_list) {
-		pr_err("Unable to allocate memory for"
-				" struct iscsi_param_list.\n");
+		pr_err("Unable to allocate memory for struct iscsi_param_list.\n");
 		goto err_out;
 	}
 	INIT_LIST_HEAD(&param_list->param_list);
@@ -567,8 +567,17 @@ int iscsi_copy_param_list(
 
 		new_param = kzalloc(sizeof(struct iscsi_param), GFP_KERNEL);
 		if (!new_param) {
-			pr_err("Unable to allocate memory for"
-				" struct iscsi_param.\n");
+			pr_err("Unable to allocate memory for struct iscsi_param.\n");
+			goto err_out;
+		}
+
+		new_param->name = kstrdup(param->name, GFP_KERNEL);
+		new_param->value = kstrdup(param->value, GFP_KERNEL);
+		if (!new_param->value || !new_param->name) {
+			kfree(new_param->value);
+			kfree(new_param->name);
+			kfree(new_param);
+			pr_err("Unable to allocate memory for parameter name/value.\n");
 			goto err_out;
 		}
 
@@ -580,32 +589,12 @@ int iscsi_copy_param_list(
 		new_param->use = param->use;
 		new_param->type_range = param->type_range;
 
-		new_param->name = kzalloc(strlen(param->name) + 1, GFP_KERNEL);
-		if (!new_param->name) {
-			pr_err("Unable to allocate memory for"
-				" parameter name.\n");
-			goto err_out;
-		}
-
-		new_param->value = kzalloc(strlen(param->value) + 1,
-				GFP_KERNEL);
-		if (!new_param->value) {
-			pr_err("Unable to allocate memory for"
-				" parameter value.\n");
-			goto err_out;
-		}
-
-		memcpy(new_param->name, param->name, strlen(param->name));
-		new_param->name[strlen(param->name)] = '\0';
-		memcpy(new_param->value, param->value, strlen(param->value));
-		new_param->value[strlen(param->value)] = '\0';
-
 		list_add_tail(&new_param->p_list, &param_list->param_list);
 	}
 
-	if (!list_empty(&param_list->param_list))
+	if (!list_empty(&param_list->param_list)) {
 		*dst_param_list = param_list;
-	else {
+	} else {
 		pr_err("No parameters allocated.\n");
 		goto err_out;
 	}
@@ -885,8 +874,8 @@ static int iscsi_check_numerical_value(struct iscsi_param *param, char *value_pt
 static int iscsi_check_numerical_range_value(struct iscsi_param *param, char *value)
 {
 	char *left_val_ptr = NULL, *right_val_ptr = NULL;
-	char *tilde_ptr = NULL, *tmp_ptr = NULL;
-	u32 left_val, right_val, local_left_val, local_right_val;
+	char *tilde_ptr = NULL;
+	u32 left_val, right_val, local_left_val;
 
 	if (strcmp(param->name, IFMARKINT) &&
 	    strcmp(param->name, OFMARKINT)) {
@@ -914,8 +903,8 @@ static int iscsi_check_numerical_range_value(struct iscsi_param *param, char *va
 	if (iscsi_check_numerical_value(param, right_val_ptr) < 0)
 		return -1;
 
-	left_val = simple_strtoul(left_val_ptr, &tmp_ptr, 0);
-	right_val = simple_strtoul(right_val_ptr, &tmp_ptr, 0);
+	left_val = simple_strtoul(left_val_ptr, NULL, 0);
+	right_val = simple_strtoul(right_val_ptr, NULL, 0);
 	*tilde_ptr = '~';
 
 	if (right_val < left_val) {
@@ -939,8 +928,7 @@ static int iscsi_check_numerical_range_value(struct iscsi_param *param, char *va
 	left_val_ptr = param->value;
 	right_val_ptr = param->value + strlen(left_val_ptr) + 1;
 
-	local_left_val = simple_strtoul(left_val_ptr, &tmp_ptr, 0);
-	local_right_val = simple_strtoul(right_val_ptr, &tmp_ptr, 0);
+	local_left_val = simple_strtoul(left_val_ptr, NULL, 0);
 	*tilde_ptr = '~';
 
 	if (param->set_param) {
@@ -1200,7 +1188,7 @@ static int iscsi_check_proposer_state(struct iscsi_param *param, char *value)
 	if (IS_TYPE_NUMBER_RANGE(param)) {
 		u32 left_val = 0, right_val = 0, recieved_value = 0;
 		char *left_val_ptr = NULL, *right_val_ptr = NULL;
-		char *tilde_ptr = NULL, *tmp_ptr = NULL;
+		char *tilde_ptr = NULL;
 
 		if (!strcmp(value, IRRELEVANT) || !strcmp(value, REJECT)) {
 			if (iscsi_update_param_value(param, value) < 0)
@@ -1224,9 +1212,9 @@ static int iscsi_check_proposer_state(struct iscsi_param *param, char *value)
 
 		left_val_ptr = param->value;
 		right_val_ptr = param->value + strlen(left_val_ptr) + 1;
-		left_val = simple_strtoul(left_val_ptr, &tmp_ptr, 0);
-		right_val = simple_strtoul(right_val_ptr, &tmp_ptr, 0);
-		recieved_value = simple_strtoul(value, &tmp_ptr, 0);
+		left_val = simple_strtoul(left_val_ptr, NULL, 0);
+		right_val = simple_strtoul(right_val_ptr, NULL, 0);
+		recieved_value = simple_strtoul(value, NULL, 0);
 
 		*tilde_ptr = '~';
 
@@ -1441,7 +1429,7 @@ static int iscsi_enforce_integrity_rules(
 	u8 DataSequenceInOrder = 0;
 	u8 ErrorRecoveryLevel = 0, SessionType = 0;
 	u8 IFMarker = 0, OFMarker = 0;
-	u8 IFMarkInt_Reject = 0, OFMarkInt_Reject = 0;
+	u8 IFMarkInt_Reject = 1, OFMarkInt_Reject = 1;
 	u32 FirstBurstLength = 0, MaxBurstLength = 0;
 	struct iscsi_param *param = NULL;
 

@@ -19,6 +19,7 @@
 #include <linux/gpio.h>
 #include <linux/ioport.h>
 #include <linux/kernel.h>
+#include <linux/mutex.h>
 #include <linux/mfd/abx500/ab5500.h>
 #include <linux/mfd/dbx500-prcmu.h>
 #include <linux/platform_device.h>
@@ -62,9 +63,6 @@ void dcg2900_u8500_disable_chip(struct cg2900_chip_dev *dev)
 		gpio_set_value(info->gbf_gpio, 0);
 	if (info->pmuen_gpio != -1)
 		gpio_set_value(info->pmuen_gpio, 0);
-
-	schedule_timeout_killable(
-			msecs_to_jiffies(CHIP_ENABLE_PDB_LOW_TIMEOUT));
 }
 
 int dcg2900_u8500_setup(struct cg2900_chip_dev *dev,

@@ -16,15 +16,11 @@
 #include <linux/modem/shrm/shrm_private.h>
 #include <linux/modem/shrm/shrm_net.h>
 #include <linux/modem/modem_client.h>
-#include <linux/modem/u8500_client.h>
 #include <linux/mfd/dbx500-prcmu.h>
 #include <linux/mfd/abx500.h>
 #include <mach/reboot_reasons.h>
 #include <mach/suspend.h>
 #include <mach/prcmu-debug.h>
-#ifdef CONFIG_U8500_SHRM_ENABLE_FEATURE_SIGNATURE_VERIFICATION
-#include <mach/open_modem_shared_memory.h>
-#endif
 
 #define L2_HEADER_ISI		0x0
 #define L2_HEADER_RPC		0x1
@@ -36,9 +32,6 @@
 #define L2_HEADER_AUDIO_ADVANCED_LOOPBACK	0x81
 #define L2_HEADER_CIQ		0xC3
 #define L2_HEADER_RTC_CALIBRATION		0xC8
-#define L2_HEADER_IPCCTRL 0xDC
-#define L2_HEADER_IPCDATA 0xDD
-#define L2_HEADER_SYSCLK3	0xE6
 #define MAX_PAYLOAD 1024
 #define MOD_STUCK_TIMEOUT	6
 #define FIFO_FULL_TIMEOUT	1
@@ -51,8 +44,6 @@
 #define PRCM_HOSTACCESS_REQ	0x334
 #define PRCM_MOD_AWAKE_STATUS	0x4A0
 #define PRCM_MOD_RESETN_VAL	0x204
-
-extern void log_this(u8 pc, char* a, u32 extra1, char* b, u32 extra2);
 
 static u8 boot_state = BOOT_INIT;
 static u8 recieve_common_msg[8*1024];
@@ -117,24 +108,20 @@ void shm_mod_reset_req_work(struct kthread_work *work)
 	if (boot_state != BOOT_DONE) {
 		dev_info(shm_dev->dev, "Modem in reset state\n");
 		spin_unlock_irqrestore(&boot_lock, flags);
-		atomic_set(&mod_stuck, 0);
 		return;
 	}
 	boot_state = BOOT_UNKNOWN;
 	wmb();
 	spin_unlock_irqrestore(&boot_lock, flags);
-	dev_err(shm_dev->dev, "APE makes modem reset\n");
 	prcmu_modem_reset();
 }
 
 static void shm_ac_sleep_req_work(struct kthread_work *work)
 {
-	if (boot_state == BOOT_DONE) {
-		mutex_lock(&ac_state_mutex);
-		if (atomic_read(&ac_sleep_disable_count) == 0)
-			modem_release(shm_dev->modem);
-		mutex_unlock(&ac_state_mutex);
-	}
+	mutex_lock(&ac_state_mutex);
+	if (atomic_read(&ac_sleep_disable_count) == 0)
+		modem_release(shm_dev->modem);
+	mutex_unlock(&ac_state_mutex);
 }
 
 static void shm_ac_wake_req_work(struct kthread_work *work)
@@ -265,7 +252,7 @@ static void nl_send_unicast_message(int dst_pid)
 	int bt_state;
 	unsigned long flags;
 
-	dev_dbg(shm_dev->dev, "Sending unicast message\n");
+	dev_info(shm_dev->dev, "Sending unicast message\n");
 
 	/* prepare the NL message for unicast */
 	skb = alloc_skb(NLMSG_SPACE(MAX_PAYLOAD), GFP_KERNEL);
@@ -300,10 +287,6 @@ static void nl_send_unicast_message(int dst_pid)
 	dev_dbg(shm_dev->dev, "ret val from nl-unicast = %d\n", err);
 }
 
-bool shrm_is_modem_online(void)
-{
-	return boot_state == BOOT_DONE;
-}
 
 static int check_modem_in_reset(void)
 {
@@ -315,8 +298,7 @@ static int check_modem_in_reset(void)
 	spin_unlock_irqrestore(&boot_lock, flags);
 
 #ifdef CONFIG_U8500_SHRM_MODEM_SILENT_RESET
-	if (bt_state != BOOT_UNKNOWN &&
-			(!readl(shm_dev->ca_reset_status_rptr)))
+	if (bt_state != BOOT_UNKNOWN)
 		return 0;
 	else
 		return -ENODEV;
@@ -476,19 +458,14 @@ void shm_ac_read_notif_0_tasklet(unsigned long tasklet_data)
 		dev_info(shrm->dev, "IPC_ISA BOOT_DONE\n");
 
 		if (shrm->msr_flag) {
-#ifdef CONFIG_U8500_SHRM_DEFAULT_NET
 			shrm_start_netdev(shrm->ndev);
-#endif
-			/* To prevent kernel panic during MSR
-			if (shrm->msr_reinit_cb)
-				shrm->msr_reinit_cb(shrm->msr_cookie);
-			*/
-
 			shrm->msr_flag = 0;
+
+			/* multicast that modem is online */
+			nl_send_multicast_message(SHRM_NL_STATUS_MOD_ONLINE,
+					GFP_ATOMIC);
 		}
-		/* multicast that modem is online */
-		nl_send_multicast_message(SHRM_NL_STATUS_MOD_ONLINE,
-				GFP_ATOMIC);
+
 	} else if (boot_state == BOOT_DONE) {
 		if (writer_local_rptr != writer_local_wptr) {
 			shrm_common_tx_state = SHRM_PTR_FREE;
@@ -496,9 +473,7 @@ void shm_ac_read_notif_0_tasklet(unsigned long tasklet_data)
 					&shrm->send_ac_msg_pend_notify_0);
 		} else {
 			shrm_common_tx_state = SHRM_IDLE;
-#ifdef CONFIG_U8500_SHRM_DEFAULT_NET
 			shrm_restart_netdev(shrm->ndev);
-#endif
 		}
 	} else {
 		dev_err(shrm->dev, "Invalid boot state\n");
@@ -552,14 +527,18 @@ void shm_ac_read_notif_1_tasklet(unsigned long tasklet_data)
 
 void shm_ca_sleep_req_work(struct kthread_work *work)
 {
+	u8 bt_state;
 	unsigned long flags;
 
 	dev_dbg(shm_dev->dev, "%s:IRQ_PRCMU_CA_SLEEP\n", __func__);
 
+	spin_lock_irqsave(&boot_lock, flags);
+	bt_state = boot_state;
+	spin_unlock_irqrestore(&boot_lock, flags);
+
 	local_irq_save(flags);
 	preempt_disable();
-	if ((boot_state != BOOT_DONE) ||
-			(readl(shm_dev->ca_reset_status_rptr))) {
+	if (bt_state != BOOT_DONE) {
 		dev_err(shm_dev->dev, "%s:Modem state reset or unknown\n",
 				__func__);
 		preempt_enable();
@@ -577,9 +556,6 @@ void shm_ca_sleep_req_work(struct kthread_work *work)
 		local_irq_restore(flags);
 		return;
 	}
-
-	log_this(40, NULL, 0, NULL, 0);
-	trace_printk("CA_WAKE_ACK\n");
 	writel((1<<GOP_CA_WAKE_ACK_BIT),
 		shm_dev->intr_base + GOP_SET_REGISTER_BASE);
 	preempt_enable();
@@ -587,9 +563,7 @@ void shm_ca_sleep_req_work(struct kthread_work *work)
 
 	hrtimer_start(&timer, ktime_set(0, 10*NSEC_PER_MSEC),
 			HRTIMER_MODE_REL);
-	if (suspend_sleep_is_blocked()) {
-		suspend_unblock_sleep();
-	}
+	suspend_unblock_sleep();
 	atomic_dec(&ac_sleep_disable_count);
 }
 
@@ -600,17 +574,9 @@ void shm_ca_wake_req_work(struct kthread_work *work)
 			struct shrm_dev, shm_ca_wake_req);
 
 	/* initialize the FIFO Variables */
-	if (boot_state == BOOT_INIT) {
-#ifdef CONFIG_U8500_SHRM_ENABLE_FEATURE_SIGNATURE_VERIFICATION
-		/* Unlock the shared memory before accessing it */
-		if (open_modem_shared_memory()) {
-			dev_err(shrm->dev,
-				"Unable to unlock the shared memory\n");
-			return;
-		}
-#endif
+	if (boot_state == BOOT_INIT)
 		shm_fifo_init(shrm);
-	}
+
 	mutex_lock(&ac_state_mutex);
 	modem_request(shrm->modem);
 	mutex_unlock(&ac_state_mutex);
@@ -634,8 +600,6 @@ void shm_ca_wake_req_work(struct kthread_work *work)
 		local_irq_restore(flags);
 	}
 
-	log_this(40, NULL, 1, NULL, 0);
-	trace_printk("CA_WAKE_ACK\n");
 	/* send ca_wake_ack_interrupt to CMU */
 	writel((1<<GOP_CA_WAKE_ACK_BIT),
 			shm_dev->intr_base + GOP_SET_REGISTER_BASE);
@@ -645,6 +609,9 @@ void shm_ca_wake_req_work(struct kthread_work *work)
 #ifdef CONFIG_U8500_SHRM_MODEM_SILENT_RESET
 static int shrm_modem_reset_sequence(void)
 {
+	int err;
+	unsigned long flags;
+
 	hrtimer_cancel(&timer);
 	hrtimer_cancel(&mod_stuck_timer_0);
 	hrtimer_cancel(&mod_stuck_timer_1);
@@ -663,9 +630,9 @@ static int shrm_modem_reset_sequence(void)
 	atomic_set(&ac_sleep_disable_count, 0);
 	atomic_set(&ac_msg_pend_1, 0);
 
-	/* Notification of the crash to SIPC layer */
-	if (shm_dev->msr_crash_cb)
-		shm_dev->msr_crash_cb(shm_dev->msr_cookie);
+	/* workaround for MSR */
+	queue_kthread_work(&shm_dev->shm_ac_wake_kw,
+			&shm_dev->shm_ac_wake_req);
 
 	/* reset char device queues */
 	shrm_char_reset_queues(shm_dev);
@@ -679,22 +646,8 @@ static int shrm_modem_reset_sequence(void)
 	/* set the msr flag */
 	shm_dev->msr_flag = 1;
 
-	/* The order is very important here */
-	queue_kthread_work(&shm_dev->shm_ac_wake_kw, &shm_dev->shm_ac_wake_req);
-	queue_kthread_work(&shm_dev->shm_ac_wake_kw, &shm_dev->shm_mod_reset_process);
-
-	return 0;
-}
-
-static void shm_mod_reset_work(struct kthread_work *work)
-{
-	int err;
-	unsigned long flags;
-
 	/* multicast that modem is going to reset */
-	err = nl_send_multicast_message(SHRM_NL_MOD_RESET, GFP_KERNEL);
-	if (err)
-		dev_err(shm_dev->dev, "unable to send netlink message %d", err);
+	err = nl_send_multicast_message(SHRM_NL_MOD_RESET, GFP_ATOMIC);
 
 	/* reset the boot state */
 	spin_lock_irqsave(&boot_lock, flags);
@@ -713,9 +666,7 @@ static void shm_mod_reset_work(struct kthread_work *work)
 	enable_irq(IRQ_PRCMU_CA_WAKE);
 	enable_irq(IRQ_PRCMU_CA_SLEEP);
 
-	if (suspend_sleep_is_blocked()) {
-		suspend_unblock_sleep();
-	}
+	return err;
 }
 #endif
 
@@ -782,10 +733,9 @@ static irqreturn_t shrm_prcmu_irq_handler(int irq, void *data)
 		disable_irq_nosync(IRQ_PRCMU_CA_WAKE);
 		disable_irq_nosync(IRQ_PRCMU_CA_SLEEP);
 
-#ifdef CONFIG_U8500_SHRM_DEFAULT_NET
 		/* stop network queue */
 		shrm_stop_netdev(shm_dev->ndev);
-#endif
+
 		tasklet_schedule(&shrm_sw_reset_callback);
 		break;
 	default:
@@ -825,8 +775,6 @@ static void send_ac_msg_pend_notify_0_work(struct kthread_work *work)
 		return;
 	}
 
-	log_this(251, NULL, 0, NULL, 0);
-	trace_printk("AC COM PEND NOTIF\n");
 	/* Trigger AcMsgPendingNotification to CMU */
 	writel((1<<GOP_COMMON_AC_MSG_PENDING_NOTIFICATION_BIT),
 			shrm->intr_base + GOP_SET_REGISTER_BASE);
@@ -875,8 +823,6 @@ static void send_ac_msg_pend_notify_1_work(struct kthread_work *work)
 		return;
 	}
 
-	log_this(252, NULL, 0, NULL, 0);
-	trace_printk("AC AUD PEND NOTIF\n");
 	/* Trigger AcMsgPendingNotification to CMU */
 	writel((1<<GOP_AUDIO_AC_MSG_PENDING_NOTIFICATION_BIT),
 			shrm->intr_base + GOP_SET_REGISTER_BASE);
@@ -902,7 +848,7 @@ void shm_nl_receive(struct sk_buff *skb)
 	msg = *((int *)(NLMSG_DATA(nlh)));
 	switch (msg) {
 	case SHRM_NL_MOD_QUERY_STATE:
-		dev_dbg(shm_dev->dev, "mod-query-state from user-space\n");
+		dev_info(shm_dev->dev, "mod-query-state from user-space\n");
 		nl_send_unicast_message(nlh->nlmsg_pid);
 		break;
 
@@ -929,7 +875,7 @@ int shrm_protocol_init(struct shrm_dev *shrm,
 			received_msg_handler common_rx_handler,
 			received_msg_handler audio_rx_handler)
 {
-	int err = 0;
+	int err;
 	struct sched_param param = { .sched_priority = MAX_RT_PRIO-1 };
 
 	shm_dev = shrm;
@@ -1020,7 +966,6 @@ int shrm_protocol_init(struct shrm_dev *shrm,
 	init_kthread_work(&shrm->shm_ca_sleep_req, shm_ca_sleep_req_work);
 	init_kthread_work(&shrm->shm_ac_sleep_req, shm_ac_sleep_req_work);
 	init_kthread_work(&shrm->shm_ac_wake_req, shm_ac_wake_req_work);
-	init_kthread_work(&shrm->shm_mod_reset_process, shm_mod_reset_work);
 	init_kthread_work(&shrm->shm_mod_reset_req, shm_mod_reset_req_work);
 	init_kthread_work(&shrm->shm_print_dbg_info, shm_print_dbg_info_work);
 
@@ -1059,18 +1004,8 @@ int shrm_protocol_init(struct shrm_dev *shrm,
 		dev_err(shm_dev->dev, "netlink socket creation failed\n");
 		goto drop;
 	}
-
-	netlink_set_nonroot(NETLINK_SHRM, NL_NONROOT_RECV);
 #endif
-#ifdef CONFIG_U8500_KERNEL_CLIENT
-	err = u8500_kernel_client_init(shrm);
-#endif
-	/*
-	 * Since modem is loaded via kernel, kernel should make sure to set
-	 * host access port, to enable modem.
-	 */
-	modem_request(shrm->modem);
-	return err;
+	return 0;
 
 #ifdef CONFIG_U8500_SHRM_MODEM_SILENT_RESET
 drop:
@@ -1097,9 +1032,6 @@ free_kw1:
 
 void shrm_protocol_deinit(struct shrm_dev *shrm)
 {
-#ifdef CONFIG_U8500_KERNEL_CLIENT
-	u8500_kernel_client_exit();
-#endif
 	free_irq(IRQ_PRCMU_CA_SLEEP, NULL);
 	free_irq(IRQ_PRCMU_CA_WAKE, NULL);
 	free_irq(IRQ_PRCMU_MODEM_SW_RESET_REQ, NULL);
@@ -1140,8 +1072,6 @@ irqreturn_t ca_wake_irq_handler(int irq, void *ctrlr)
 				shrm->intr_base + GOP_CLEAR_REGISTER_BASE);
 
 	/* send ca_wake_ack_interrupt to CMU */
-	log_this(40, NULL, 2, NULL, 0);
-	trace_printk("CA_WAKE_ACK\n");
 	writel((1 << GOP_CA_WAKE_ACK_BIT),
 		shrm->intr_base + GOP_SET_REGISTER_BASE);
 
@@ -1169,7 +1099,7 @@ irqreturn_t ac_read_notif_0_irq_handler(int irq, void *ctrlr)
 	if (check_modem_in_reset()) {
 		dev_err(shrm->dev, "%s:Modem state reset or unknown.\n",
 				__func__);
-		return IRQ_NONE;
+		return IRQ_HANDLED;
 	}
 
 	shm_ac_read_0_tasklet.data = (unsigned long)shrm;
@@ -1182,7 +1112,7 @@ irqreturn_t ac_read_notif_0_irq_handler(int irq, void *ctrlr)
 				__func__);
 		preempt_enable();
 		local_irq_restore(flags);
-		return IRQ_NONE;
+		return IRQ_HANDLED;
 	}
 
 	if (!get_host_accessport_val()) {
@@ -1191,7 +1121,7 @@ irqreturn_t ac_read_notif_0_irq_handler(int irq, void *ctrlr)
 				&shm_dev->shm_mod_reset_req);
 		preempt_enable();
 		local_irq_restore(flags);
-		return IRQ_NONE;
+		return IRQ_HANDLED;
 	}
 	/* Clear the interrupt */
 	writel((1 << GOP_COMMON_AC_READ_NOTIFICATION_BIT),
@@ -1221,7 +1151,7 @@ irqreturn_t ac_read_notif_1_irq_handler(int irq, void *ctrlr)
 	if (check_modem_in_reset()) {
 		dev_err(shrm->dev, "%s:Modem state reset or unknown.\n",
 				__func__);
-		return IRQ_NONE;
+		return IRQ_HANDLED;
 	}
 
 	shm_ac_read_1_tasklet.data = (unsigned long)shrm;
@@ -1234,7 +1164,7 @@ irqreturn_t ac_read_notif_1_irq_handler(int irq, void *ctrlr)
 				__func__);
 		preempt_enable();
 		local_irq_restore(flags);
-		return IRQ_NONE;
+		return IRQ_HANDLED;
 	}
 
 	if (!get_host_accessport_val()) {
@@ -1243,7 +1173,7 @@ irqreturn_t ac_read_notif_1_irq_handler(int irq, void *ctrlr)
 				&shm_dev->shm_mod_reset_req);
 		preempt_enable();
 		local_irq_restore(flags);
-		return IRQ_NONE;
+		return IRQ_HANDLED;
 	}
 	/* Clear the interrupt */
 	writel((1 << GOP_AUDIO_AC_READ_NOTIFICATION_BIT),
@@ -1265,7 +1195,7 @@ irqreturn_t ca_msg_pending_notif_0_irq_handler(int irq, void *ctrlr)
 	if (check_modem_in_reset()) {
 		dev_err(shrm->dev, "%s:Modem state reset or unknown.\n",
 				__func__);
-		return IRQ_NONE;
+		return IRQ_HANDLED;
 	}
 
 	tasklet_schedule(&shm_ca_0_tasklet);
@@ -1277,7 +1207,7 @@ irqreturn_t ca_msg_pending_notif_0_irq_handler(int irq, void *ctrlr)
 				__func__);
 		preempt_enable();
 		local_irq_restore(flags);
-		return IRQ_NONE;
+		return IRQ_HANDLED;
 	}
 
 	if (!get_host_accessport_val()) {
@@ -1286,11 +1216,9 @@ irqreturn_t ca_msg_pending_notif_0_irq_handler(int irq, void *ctrlr)
 				&shm_dev->shm_mod_reset_req);
 		preempt_enable();
 		local_irq_restore(flags);
-		return IRQ_NONE;
+		return IRQ_HANDLED;
 	}
 	/* Clear the interrupt */
-	log_this(248, NULL, 0, NULL, 0);
-	trace_printk("CA MSG PEND\n");
 	writel((1 << GOP_COMMON_CA_MSG_PENDING_NOTIFICATION_BIT),
 			shrm->intr_base + GOP_CLEAR_REGISTER_BASE);
 	preempt_enable();
@@ -1310,7 +1238,7 @@ irqreturn_t ca_msg_pending_notif_1_irq_handler(int irq, void *ctrlr)
 	if (check_modem_in_reset()) {
 		dev_err(shrm->dev, "%s:Modem state reset or unknown.\n",
 				__func__);
-		return IRQ_NONE;
+		return IRQ_HANDLED;
 	}
 
 	tasklet_schedule(&shm_ca_1_tasklet);
@@ -1322,7 +1250,7 @@ irqreturn_t ca_msg_pending_notif_1_irq_handler(int irq, void *ctrlr)
 				__func__);
 		preempt_enable();
 		local_irq_restore(flags);
-		return IRQ_NONE;
+		return IRQ_HANDLED;
 	}
 
 	if (!get_host_accessport_val()) {
@@ -1331,11 +1259,9 @@ irqreturn_t ca_msg_pending_notif_1_irq_handler(int irq, void *ctrlr)
 				&shm_dev->shm_mod_reset_req);
 		preempt_enable();
 		local_irq_restore(flags);
-		return IRQ_NONE;
+		return IRQ_HANDLED;
 	}
 	/* Clear the interrupt */
-	log_this(249, NULL, 0, NULL, 0);
-	trace_printk("CA MSG PEND\n");
 	writel((1<<GOP_AUDIO_CA_MSG_PENDING_NOTIFICATION_BIT),
 			shrm->intr_base+GOP_CLEAR_REGISTER_BASE);
 	preempt_enable();
@@ -1363,7 +1289,7 @@ int shm_write_msg(struct shrm_dev *shrm, u8 l2_header,
 					void *addr, u32 length)
 {
 	u8 channel = 0;
-	int ret, i;
+	int ret;
 
 	dev_dbg(shrm->dev, "%s IN\n", __func__);
 
@@ -1371,15 +1297,7 @@ int shm_write_msg(struct shrm_dev *shrm, u8 l2_header,
 		dev_err(shrm->dev,
 			"error:after boot done  call this fn, L2Header = %d\n",
 			l2_header);
-		dev_err(shrm->dev, "packet not sent, modem in reset");
-		for (i = 0; i < length; i++)
-			dev_dbg(shrm->dev, "data[%d]=%02x\n", i, *(u8 *)addr);
-		/*
-		 * If error is returned then phonet tends to resend the msg
-		 * this will lead to the msg bouncing to and fro between
-		 * phonet and shrm, hence dont return error.
-		*/
-		ret = 0;
+		ret = -ENODEV;
 		goto out;
 	}
 
@@ -1389,10 +1307,7 @@ int shm_write_msg(struct shrm_dev *shrm, u8 l2_header,
 			(l2_header == L2_HEADER_COMMON_SIMPLE_LOOPBACK) ||
 			(l2_header == L2_HEADER_COMMON_ADVANCED_LOOPBACK) ||
 			(l2_header == L2_HEADER_CIQ) ||
-			(l2_header == L2_HEADER_RTC_CALIBRATION) ||
-			(l2_header == L2_HEADER_IPCCTRL) ||
-			(l2_header == L2_HEADER_IPCDATA) ||
-			(l2_header == L2_HEADER_SYSCLK3)) {
+			(l2_header == L2_HEADER_RTC_CALIBRATION)) {
 		channel = 0;
 		if (shrm_common_tx_state == SHRM_SLEEP_STATE)
 			shrm_common_tx_state = SHRM_PTR_FREE;
@@ -1476,9 +1391,6 @@ void ca_msg_read_notification_0(struct shrm_dev *shrm)
 			local_irq_restore(flags);
 			return;
 		}
-
-		log_this(253, NULL, 0, NULL, 0);
-		trace_printk("CA COM READ NOTIF\n");
 		/* Trigger CaMsgReadNotification to CMU */
 		writel((1 << GOP_COMMON_CA_READ_NOTIFICATION_BIT),
 			shrm->intr_base + GOP_SET_REGISTER_BASE);
@@ -1518,9 +1430,6 @@ void ca_msg_read_notification_1(struct shrm_dev *shrm)
 			local_irq_restore(flags);
 			return;
 		}
-
-		log_this(254, NULL, 0, NULL, 0);
-		trace_printk("CA AUD READ NOTIF\n");
 		/* Trigger CaMsgReadNotification to CMU */
 		writel((1<<GOP_AUDIO_CA_READ_NOTIFICATION_BIT),
 			shrm->intr_base+GOP_SET_REGISTER_BASE);

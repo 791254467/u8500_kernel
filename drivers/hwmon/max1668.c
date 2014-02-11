@@ -1,23 +1,23 @@
 /*
-    Copyright (c) 2011 David George <david.george@ska.ac.za>
-
-    based on adm1021.c
-    some credit to Christoph Scheurer, but largely a rewrite
-
-    This program is free software; you can redistribute it and/or modify
-    it under the terms of the GNU General Public License as published by
-    the Free Software Foundation; either version 2 of the License, or
-    (at your option) any later version.
-
-    This program is distributed in the hope that it will be useful,
-    but WITHOUT ANY WARRANTY; without even the implied warranty of
-    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-    GNU General Public License for more details.
-
-    You should have received a copy of the GNU General Public License
-    along with this program; if not, write to the Free Software
-    Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
-*/
+ * Copyright (c) 2011 David George <david.george@ska.ac.za>
+ *
+ * based on adm1021.c
+ * some credit to Christoph Scheurer, but largely a rewrite
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 2 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program; if not, write to the Free Software
+ * Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
+ */
 
 #include <linux/module.h>
 #include <linux/init.h>
@@ -59,7 +59,7 @@ static unsigned short max1668_addr_list[] = {
 #define DEV_ID_MAX1989		0xb
 
 /* read only mode module parameter */
-static int read_only;
+static bool read_only;
 module_param(read_only, bool, 0);
 MODULE_PARM_DESC(read_only, "Don't set any values, read only mode");
 
@@ -122,16 +122,14 @@ static struct max1668_data *max1668_update_device(struct device *dev)
 		ret = ERR_PTR(val);
 		goto abort;
 	}
-	data->alarms &= 0x00ff;
-	data->alarms |= ((u8) (val & 0x60)) << 8;
+	data->alarms = val << 8;
 
 	val = i2c_smbus_read_byte_data(client, MAX1668_REG_STAT2);
 	if (unlikely(val < 0)) {
 		ret = ERR_PTR(val);
 		goto abort;
 	}
-	data->alarms &= 0xff00;
-	data->alarms |= ((u8) val);
+	data->alarms |= val;
 
 	data->last_updated = jiffies;
 	data->valid = 1;
@@ -187,6 +185,19 @@ static ssize_t show_alarm(struct device *dev, struct device_attribute *attr,
 		return PTR_ERR(data);
 
 	return sprintf(buf, "%u\n", (data->alarms >> index) & 0x1);
+}
+
+static ssize_t show_fault(struct device *dev,
+			  struct device_attribute *devattr, char *buf)
+{
+	int index = to_sensor_dev_attr(devattr)->index;
+	struct max1668_data *data = max1668_update_device(dev);
+
+	if (IS_ERR(data))
+		return PTR_ERR(data);
+
+	return sprintf(buf, "%u\n",
+		       (data->alarms & (1 << 12)) && data->temp[index] == 127);
 }
 
 static ssize_t set_temp_max(struct device *dev,
@@ -276,6 +287,11 @@ static SENSOR_DEVICE_ATTR(temp4_max_alarm, S_IRUGO, show_alarm, NULL, 2);
 static SENSOR_DEVICE_ATTR(temp5_min_alarm, S_IRUGO, show_alarm, NULL, 1);
 static SENSOR_DEVICE_ATTR(temp5_max_alarm, S_IRUGO, show_alarm, NULL, 0);
 
+static SENSOR_DEVICE_ATTR(temp2_fault, S_IRUGO, show_fault, NULL, 1);
+static SENSOR_DEVICE_ATTR(temp3_fault, S_IRUGO, show_fault, NULL, 2);
+static SENSOR_DEVICE_ATTR(temp4_fault, S_IRUGO, show_fault, NULL, 3);
+static SENSOR_DEVICE_ATTR(temp5_fault, S_IRUGO, show_fault, NULL, 4);
+
 /* Attributes common to MAX1668, MAX1989 and MAX1805 */
 static struct attribute *max1668_attribute_common[] = {
 	&sensor_dev_attr_temp1_max.dev_attr.attr,
@@ -294,6 +310,9 @@ static struct attribute *max1668_attribute_common[] = {
 	&sensor_dev_attr_temp2_min_alarm.dev_attr.attr,
 	&sensor_dev_attr_temp3_max_alarm.dev_attr.attr,
 	&sensor_dev_attr_temp3_min_alarm.dev_attr.attr,
+
+	&sensor_dev_attr_temp2_fault.dev_attr.attr,
+	&sensor_dev_attr_temp3_fault.dev_attr.attr,
 	NULL
 };
 
@@ -310,13 +329,16 @@ static struct attribute *max1668_attribute_unique[] = {
 	&sensor_dev_attr_temp4_min_alarm.dev_attr.attr,
 	&sensor_dev_attr_temp5_max_alarm.dev_attr.attr,
 	&sensor_dev_attr_temp5_min_alarm.dev_attr.attr,
+
+	&sensor_dev_attr_temp4_fault.dev_attr.attr,
+	&sensor_dev_attr_temp5_fault.dev_attr.attr,
 	NULL
 };
 
-static mode_t max1668_attribute_mode(struct kobject *kobj,
+static umode_t max1668_attribute_mode(struct kobject *kobj,
 				     struct attribute *attr, int index)
 {
-	int ret = S_IRUGO;
+	umode_t ret = S_IRUGO;
 	if (read_only)
 		return ret;
 	if (attr == &sensor_dev_attr_temp1_max.dev_attr.attr ||
@@ -462,19 +484,8 @@ static struct i2c_driver max1668_driver = {
 	.address_list = max1668_addr_list,
 };
 
-static int __init sensors_max1668_init(void)
-{
-	return i2c_add_driver(&max1668_driver);
-}
-
-static void __exit sensors_max1668_exit(void)
-{
-	i2c_del_driver(&max1668_driver);
-}
+module_i2c_driver(max1668_driver);
 
 MODULE_AUTHOR("David George <david.george@ska.ac.za>");
 MODULE_DESCRIPTION("MAX1668 remote temperature sensor driver");
 MODULE_LICENSE("GPL");
-
-module_init(sensors_max1668_init)
-module_exit(sensors_max1668_exit)

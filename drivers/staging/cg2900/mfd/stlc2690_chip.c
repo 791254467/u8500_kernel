@@ -285,8 +285,7 @@ static void send_bd_address(struct stlc2690_chip_info *info)
 	dev_dbg(BOOT_DEV, "New boot_state: BOOT_SEND_BD_ADDRESS\n");
 	info->boot_state = BOOT_SEND_BD_ADDRESS;
 
-	cg2900_send_bt_cmd(info->user_in_charge, info->logger, cmd, plen,
-			CHANNEL_BT_CMD);
+	cg2900_send_bt_cmd(info->user_in_charge, info->logger, cmd, plen);
 
 	kfree(cmd);
 }
@@ -304,9 +303,7 @@ static void send_settings_file(struct stlc2690_chip_info *info)
 
 	bytes_sent = cg2900_read_and_send_file_part(info->user_in_charge,
 						    info->logger,
-						    &info->file_info,
-						    info->file_info.fw_file_ssf,
-						    CHANNEL_BT_CMD);
+						    &info->file_info);
 	if (bytes_sent > 0) {
 		/* Data sent. Wait for CmdComplete */
 		return;
@@ -323,7 +320,9 @@ static void send_settings_file(struct stlc2690_chip_info *info)
 	info->download_state = DOWNLOAD_SUCCESS;
 
 	/* Settings file finished. Release used resources */
-	dev_dbg(BOOT_DEV, "Settings file finished\n");
+	dev_dbg(BOOT_DEV, "Settings file finished, release used resources\n");
+	release_firmware(info->file_info.fw_file);
+	info->file_info.fw_file = NULL;
 
 	dev_dbg(BOOT_DEV, "New file_load_state: FILE_LOAD_NO_MORE_FILES\n");
 	info->file_load_state = FILE_LOAD_NO_MORE_FILES;
@@ -345,12 +344,11 @@ static void send_patch_file(struct cg2900_chip_dev *dev)
 	int err;
 	int bytes_sent;
 	struct stlc2690_chip_info *info = dev->c_data;
+	int file_name_size = strlen("STLC2690_XXXX_XXXX_settings.fw");
 
 	bytes_sent = cg2900_read_and_send_file_part(info->user_in_charge,
 						    info->logger,
-						    &info->file_info,
-						    info->file_info.fw_file_ptc,
-						    CHANNEL_BT_CMD);
+						    &info->file_info);
 	if (bytes_sent > 0) {
 		/* Data sent. Wait for CmdComplete */
 		return;
@@ -364,8 +362,34 @@ static void send_patch_file(struct cg2900_chip_dev *dev)
 	/* No data was sent. This file is finished */
 	info->download_state = DOWNLOAD_SUCCESS;
 
-	dev_dbg(BOOT_DEV, "Patch file finished\n");
+	dev_dbg(BOOT_DEV, "Patch file finished, release used resources\n");
+	release_firmware(info->file_info.fw_file);
+	info->file_info.fw_file = NULL;
 
+	/*
+	 * Create the settings file name from HCI revision and sub_version.
+	 * file_name_size does not include terminating NULL character
+	 * so add 1.
+	 */
+	err = snprintf(info->settings_file_name, file_name_size + 1,
+			"STLC2690_%04X_%04X_settings.fw",
+			dev->chip.hci_revision, dev->chip.hci_sub_version);
+	if (err == file_name_size) {
+		dev_dbg(BOOT_DEV, "Downloading settings file %s\n",
+				info->settings_file_name);
+	} else {
+		dev_err(BOOT_DEV, "Settings file name failed! err=%d\n", err);
+		goto error_handling;
+	}
+
+	/* Retrieve the settings file */
+	err = request_firmware(&info->file_info.fw_file,
+			       info->settings_file_name,
+			       info->chip_dev->dev);
+	if (err) {
+		dev_err(BOOT_DEV, "Couldn't get settings file (%d)\n", err);
+		goto error_handling;
+	}
 	/* Now send the settings file */
 	dev_dbg(BOOT_DEV,
 		"New file_load_state: FILE_LOAD_GET_STATIC_SETTINGS\n");
@@ -413,9 +437,11 @@ static void work_reset_after_error(struct work_struct *work)
  */
 static void work_load_patch_and_settings(struct work_struct *work)
 {
+	int err = 0;
 	struct cg2900_work *my_work;
 	struct cg2900_chip_dev *dev;
 	struct stlc2690_chip_info *info;
+	int file_name_size = strlen("STLC2690_XXXX_XXXX_patch.fw");
 
 	if (!work) {
 		dev_err(MAIN_DEV,
@@ -431,6 +457,22 @@ static void work_load_patch_and_settings(struct work_struct *work)
 	if (info->boot_state != BOOT_GET_FILES_TO_LOAD)
 		goto finished;
 
+	/*
+	 * Create the patch file name from HCI revision and sub_version.
+	 * file_name_size does not include terminating NULL character
+	 * so add 1.
+	 */
+	err = snprintf(info->patch_file_name, file_name_size + 1,
+			"STLC2690_%04X_%04X_patch.fw", dev->chip.hci_revision,
+			dev->chip.hci_sub_version);
+	if (err == file_name_size) {
+		dev_dbg(BOOT_DEV, "Downloading patch file %s\n",
+				info->patch_file_name);
+	} else {
+		dev_err(BOOT_DEV, "Patch file name failed! err=%d\n", err);
+		goto error_handling;
+	}
+
 	/* We now all info needed */
 	dev_dbg(BOOT_DEV, "New boot_state: BOOT_DOWNLOAD_PATCH\n");
 	info->boot_state = BOOT_DOWNLOAD_PATCH;
@@ -440,11 +482,24 @@ static void work_load_patch_and_settings(struct work_struct *work)
 	info->file_load_state = FILE_LOAD_GET_PATCH;
 	info->file_info.chunk_id = 0;
 	info->file_info.file_offset = 0;
+	info->file_info.fw_file = NULL;
 
+	/* OK. Now it is time to download the patches */
+	err = request_firmware(&(info->file_info.fw_file),
+			       info->patch_file_name,
+			       dev->dev);
+	if (err < 0) {
+		dev_err(BOOT_DEV, "Couldn't get patch file (%d)\n", err);
+		goto error_handling;
+	}
 	send_patch_file(dev);
 
 	goto finished;
 
+error_handling:
+	dev_dbg(BOOT_DEV, "New boot_state: BOOT_FAILED\n");
+	info->boot_state = BOOT_FAILED;
+	chip_startup_finished(info, -EIO);
 finished:
 	kfree(my_work);
 }
@@ -559,7 +614,7 @@ static bool handle_vs_store_in_fs_cmd_complete(struct cg2900_chip_dev *dev,
 		cmd.opcode = cpu_to_le16(HCI_OP_RESET);
 		cmd.plen = 0; /* No parameters for Reset */
 		cg2900_send_bt_cmd(info->user_in_charge, info->logger, &cmd,
-				   sizeof(cmd), CHANNEL_BT_CMD);
+				   sizeof(cmd));
 	} else {
 		dev_err(BOOT_DEV,
 			"Command complete for StoreInFS received with error "
@@ -600,7 +655,10 @@ static bool handle_vs_write_file_block_cmd_complete(struct cg2900_chip_dev *dev,
 		info->download_state = DOWNLOAD_FAILED;
 		dev_dbg(BOOT_DEV, "New boot_state: BOOT_FAILED\n");
 		info->boot_state = BOOT_FAILED;
-
+		if (info->file_info.fw_file) {
+			release_firmware(info->file_info.fw_file);
+			info->file_info.fw_file = NULL;
+		}
 		cg2900_create_work_item(info->wq, work_reset_after_error, dev);
 	}
 
@@ -636,7 +694,10 @@ static bool handle_vs_write_file_block_cmd_status(struct cg2900_chip_dev *dev,
 		info->download_state = DOWNLOAD_FAILED;
 		dev_dbg(BOOT_DEV, "New boot_state: BOOT_FAILED\n");
 		info->boot_state = BOOT_FAILED;
-
+		if (info->file_info.fw_file) {
+			release_firmware(info->file_info.fw_file);
+			info->file_info.fw_file = NULL;
+		}
 		cg2900_create_work_item(info->wq, work_reset_after_error, dev);
 	}
 
@@ -782,16 +843,6 @@ static void chip_removed(struct cg2900_chip_dev *dev)
 	struct stlc2690_chip_info *info = dev->c_data;
 
 	mfd_remove_devices(dev->dev);
-	if (info->file_info.fw_file_ptc) {
-		release_firmware(info->file_info.fw_file_ptc);
-		info->file_info.fw_file_ptc = NULL;
-	}
-
-	if (info->file_info.fw_file_ssf) {
-		release_firmware(info->file_info.fw_file_ssf);
-		info->file_info.fw_file_ssf = NULL;
-	}
-
 	kfree(info->settings_file_name);
 	kfree(info->patch_file_name);
 	destroy_workqueue(info->wq);
@@ -929,8 +980,7 @@ static int stlc2690_open(struct cg2900_user_data *user)
 		info->main_state = STLC2690_BOOTING;
 		cmd.opcode = cpu_to_le16(HCI_OP_RESET);
 		cmd.plen = 0; /* No parameters for HCI reset */
-		cg2900_send_bt_cmd(user, info->logger, &cmd, sizeof(cmd),
-				CHANNEL_BT_CMD);
+		cg2900_send_bt_cmd(user, info->logger, &cmd, sizeof(cmd));
 
 		dev_dbg(user->dev, "Wait up to 15 seconds for chip to start\n");
 		wait_event_timeout(main_wait_queue,
@@ -1378,88 +1428,6 @@ static void set_plat_data(struct mfd_cell *cell, struct cg2900_chip_dev *dev)
 }
 
 /**
- * fetch_firmware_files() - Do a request_firmware for ssf/ptc files.
- * @dev:	Chip info structure.
- *
- * Returns:
- *   system wide error.
- */
-static int fetch_firmware_files(struct cg2900_chip_dev *dev,
-		struct stlc2690_chip_info *info)
-{
-	int filename_size_ptc = strlen("STLC2690_XXXX_XXXX_patch.fw");
-	int filename_size_ssf = strlen("STLC2690_XXXX_XXXX_settings.fw");
-	int err;
-
-	/*
-	 * Create the patch file name from HCI revision and sub_version.
-	 * filename_size_ptc does not include terminating NULL character
-	 * so add 1.
-	 */
-	err = snprintf(info->patch_file_name, filename_size_ptc + 1,
-			"STLC2690_%04X_%04X_patch.fw", dev->chip.hci_revision,
-			dev->chip.hci_sub_version);
-	if (err == filename_size_ptc) {
-		dev_dbg(BOOT_DEV, "Downloading patch file %s\n",
-				info->patch_file_name);
-	} else {
-		dev_err(BOOT_DEV, "Patch file name failed! err=%d\n", err);
-		goto error_handling;
-	}
-
-	/* OK. Now it is time to download the patches */
-	err = request_firmware(&(info->file_info.fw_file_ptc),
-			info->patch_file_name,
-			dev->dev);
-	if (err < 0) {
-		dev_err(BOOT_DEV, "Couldn't get patch file "
-				"(%d)\n", err);
-		goto error_handling;
-	}
-
-	/*
-	 * Create the settings file name from HCI revision and sub_version.
-	 * filename_size_ssf does not include terminating NULL character
-	 * so add 1.
-	 */
-	err = snprintf(info->settings_file_name, filename_size_ssf + 1,
-			"STLC2690_%04X_%04X_settings.fw",
-			dev->chip.hci_revision, dev->chip.hci_sub_version);
-	if (err == filename_size_ssf) {
-		dev_dbg(BOOT_DEV, "Downloading settings file %s\n",
-				info->settings_file_name);
-	} else {
-		dev_err(BOOT_DEV, "Settings file name failed! err=%d\n", err);
-		goto error_handling;
-	}
-
-	/* Retrieve the settings file */
-	err = request_firmware(&info->file_info.fw_file_ssf,
-			info->settings_file_name,
-			dev->dev);
-	if (err) {
-		dev_err(BOOT_DEV, "Couldn't get settings file "
-				"(%d)\n", err);
-		goto error_handling;
-	}
-
-	return 0;
-
-error_handling:
-	if (info->file_info.fw_file_ptc) {
-		release_firmware(info->file_info.fw_file_ptc);
-		info->file_info.fw_file_ptc = NULL;
-	}
-
-	if (info->file_info.fw_file_ssf) {
-		release_firmware(info->file_info.fw_file_ssf);
-		info->file_info.fw_file_ssf = NULL;
-	}
-
-	return err;
-}
-
-/**
  * check_chip_support() - Checks if connected chip is handled by this driver.
  * @dev:	Chip info structure.
  *
@@ -1524,13 +1492,6 @@ static bool check_chip_support(struct cg2900_chip_dev *dev)
 	if (!info->settings_file_name) {
 		dev_err(dev->dev,
 			"Couldn't allocate name buffers settings file\n");
-		goto err_handling_free_patch_name;
-	}
-
-	err = fetch_firmware_files(dev, info);
-	if (err) {
-		dev_err(dev->dev,
-				"Couldn't fetch firmware files\n");
 		goto err_handling_free_patch_name;
 	}
 

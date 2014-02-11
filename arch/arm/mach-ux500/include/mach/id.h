@@ -81,6 +81,65 @@ static inline bool __attribute_const__ cpu_is_u9540(void)
 #endif
 }
 
+/*
+ * 5500 revisions
+ */
+
+static inline bool __attribute_const__ cpu_is_u5500v1(void)
+{
+	return cpu_is_u5500() && (dbx500_revision() & 0xf0) == 0xA0;
+}
+
+static inline bool __attribute_const__ cpu_is_u5500v2(void)
+{
+	return (dbx500_id.revision & 0xf0) == 0xB0;
+}
+
+static inline bool __attribute_const__ cpu_is_u5500v20(void)
+{
+	return cpu_is_u5500() && ((dbx500_revision() & 0xf0) == 0xB0);
+}
+
+static inline bool __attribute_const__ cpu_is_u5500v21(void)
+{
+	return cpu_is_u5500() && (dbx500_revision() == 0xB1);
+}
+
+/*
+ * 8500 revisions
+ */
+
+static inline bool __attribute_const__ cpu_is_u8500v2(void)
+{
+	return cpu_is_u8500() && ((dbx500_revision() & 0xf0) == 0xB0);
+}
+
+static inline bool cpu_is_u8500v20(void)
+{
+	return cpu_is_u8500() && (dbx500_revision() == 0xB0);
+}
+
+static inline bool cpu_is_u8500v21(void)
+{
+	return cpu_is_u8500() && (dbx500_revision() == 0xB1);
+}
+
+static inline bool cpu_is_u8500v22(void)
+{
+	return cpu_is_u8500() && (dbx500_revision() == 0xB2);
+}
+
+static inline bool cpu_is_u8500v20_or_later(void)
+{
+	return cpu_is_u9540() ||
+		(cpu_is_u8500() && ((dbx500_revision() & 0xf0) >= 0xB0));
+}
+
+static inline bool ux500_is_svp(void)
+{
+	return false;
+}
+
 #define ux500_unknown_soc()	BUG()
 
 #endif

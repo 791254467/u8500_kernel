@@ -17,12 +17,11 @@
 #define JUMP_ENTRY_TYPE		stringify_in_c(FTR_ENTRY_LONG)
 #define JUMP_LABEL_NOP_SIZE	4
 
-static __always_inline bool arch_static_branch(struct jump_label_key *key)
+static __always_inline bool arch_static_branch(struct static_key *key)
 {
 	asm goto("1:\n\t"
 		 "nop\n\t"
 		 ".pushsection __jump_table,  \"aw\"\n\t"
-		 ".align 4\n\t"
 		 JUMP_ENTRY_TYPE "1b, %l[l_yes], %c0\n\t"
 		 ".popsection \n\t"
 		 : :  "i" (key) : : l_yes);
@@ -41,7 +40,6 @@ struct jump_entry {
 	jump_label_t code;
 	jump_label_t target;
 	jump_label_t key;
-	jump_label_t pad;
 };
 
 #endif /* _ASM_POWERPC_JUMP_LABEL_H */

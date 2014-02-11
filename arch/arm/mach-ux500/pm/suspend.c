@@ -11,13 +11,10 @@
 
 #include <linux/suspend.h>
 #include <linux/mfd/dbx500-prcmu.h>
+#include <linux/gpio/nomadik.h>
 #include <linux/regulator/machine.h>
 #include <linux/regulator/ab8500-debug.h>
 #include <linux/regulator/dbx500-prcmu.h>
-#include <linux/mfd/dbx500-prcmu.h>
-#include <linux/wakelock.h>
-
-#include <plat/gpio-nomadik.h>
 
 #include <mach/context.h>
 #include <mach/pm.h>
@@ -28,11 +25,7 @@
 static void (*pins_suspend_force)(void);
 static void (*pins_suspend_force_mux)(void);
 
-static bool suspend_ongoing;
-
 static suspend_state_t suspend_state = PM_SUSPEND_ON;
-static u32 suspend_wakeups;
-static u32 running_wakeups;
 
 void suspend_set_pins_force_fn(void (*force)(void), void (*force_mux)(void))
 {
@@ -40,23 +33,7 @@ void suspend_set_pins_force_fn(void (*force)(void), void (*force_mux)(void))
 	pins_suspend_force_mux = force_mux;
 }
 
-#if defined(CONFIG_MACH_SEC_GOLDEN_CHN)||defined(CONFIG_MACH_JANICE_CHN) || defined(CONFIG_MACH_CODINA_CHN) || defined(CONFIG_MACH_GAVINI_CHN)
-u32 alarm_sec;
-void suspend_set_alarm(u32 s)
-{
-	alarm_sec = s;
-}
-void ux500_rtcrtt_next_seconds(u32 sec);
-void ux500_rtcrtt_off(void);
-
-#endif
-
 static atomic_t block_sleep = ATOMIC_INIT(0);
-
-bool is_suspend_ongoing(void)
-{
-	return suspend_ongoing;
-}
 
 void suspend_block_sleep(void)
 {
@@ -68,25 +45,18 @@ void suspend_unblock_sleep(void)
 	atomic_dec(&block_sleep);
 }
 
-bool suspend_sleep_is_blocked(void)
+static bool sleep_is_blocked(void)
 {
 	return (atomic_read(&block_sleep) != 0);
 }
-
 
 static int suspend(bool do_deepsleep)
 {
 	bool pins_force = pins_suspend_force_mux && pins_suspend_force;
 	int ret = 0;
-	u32 pending_irq;
 
-	if (suspend_sleep_is_blocked()) {
+	if (sleep_is_blocked()) {
 		pr_info("suspend/resume: interrupted by modem.\n");
-		return -EBUSY;
-	}
-
-	if (has_wake_lock(WAKE_LOCK_SUSPEND)) {
-		pr_info("suspend/resume: aborted. wakelock has been taken.\n");
 		return -EBUSY;
 	}
 
@@ -97,13 +67,20 @@ static int suspend(bool do_deepsleep)
 	nmk_gpio_wakeups_suspend();
 
 	/* configure the prcm for a sleep wakeup */
-	prcmu_enable_wakeups(suspend_wakeups);
-#if  defined(CONFIG_MACH_SEC_GOLDEN_CHN)|| defined(CONFIG_MACH_JANICE_CHN) || defined(CONFIG_MACH_CODINA_CHN) || defined(CONFIG_MACH_GAVINI_CHN)
-    ux500_rtcrtt_next_seconds(alarm_sec);
+	if (cpu_is_u9500())
+		prcmu_enable_wakeups(PRCMU_WAKEUP(ABB) | PRCMU_WAKEUP(HSI0));
+	else
+#if defined(CONFIG_RTC_DRV_PL031)
+		prcmu_enable_wakeups(PRCMU_WAKEUP(ABB) | PRCMU_WAKEUP(RTC));
+#else
+		prcmu_enable_wakeups(PRCMU_WAKEUP(ABB));
 #endif
+
 	ux500_suspend_dbg_test_set_wakeup();
 
 	context_vape_save();
+
+	context_fsmc_save();
 
 	if (pins_force) {
 		/*
@@ -123,22 +100,8 @@ static int suspend(bool do_deepsleep)
 
 	ux500_pm_gic_decouple();
 
-	/* Copy GIC interrupt settings to PRCMU interrupt settings */
-	ux500_pm_prcmu_copy_gic_settings();
-
 	if (ux500_pm_gic_pending_interrupt()) {
-		pr_info("suspend/resume: pending interrupt gic\n");
-
-		/* Recouple GIC with the interrupt bus */
-		ux500_pm_gic_recouple();
-		ret = -EBUSY;
-
-		goto exit;
-	}
-
-	if (ux500_pm_prcmu_pending_interrupt(&pending_irq)) {
-		pr_info("suspend/resume: pending interrupt prcmu: %u\n",
-				pending_irq);
+		pr_info("suspend/resume: pending interrupt\n");
 
 		/* Recouple GIC with the interrupt bus */
 		ux500_pm_gic_recouple();
@@ -173,13 +136,15 @@ static int suspend(bool do_deepsleep)
 	} else {
 
 		context_clean_l1_cache_all();
-		(void) prcmu_set_power_state(PRCMU_AP_SLEEP,
+		(void) prcmu_set_power_state(APEXECUTE_TO_APSLEEP,
 					     false, false);
 		dsb();
 		__asm__ __volatile__("wfi\n\t" : : : "memory");
 	}
 
 	context_vape_restore();
+
+	context_fsmc_restore();
 
 	/* If GPIO woke us up then save the pins that caused the wake up */
 	ux500_pm_gpio_save_wake_up_status();
@@ -197,12 +162,14 @@ exit:
 		context_gpio_mux_safe_switch(false);
 		context_gpio_restore();
 	}
-#if defined(CONFIG_MACH_SEC_GOLDEN_CHN)||defined(CONFIG_MACH_JANICE_CHN) || defined(CONFIG_MACH_CODINA_CHN) || defined(CONFIG_MACH_GAVINI_CHN)
-    ux500_rtcrtt_off();
-#endif
 
-	/* Configure the prcmu with the wake-ups that cpuidle needs */
-	prcmu_enable_wakeups(running_wakeups);
+	/* This is what cpuidle wants */
+	if (cpu_is_u9500())
+		prcmu_enable_wakeups(PRCMU_WAKEUP(ARM) | PRCMU_WAKEUP(RTC) |
+				     PRCMU_WAKEUP(ABB) | PRCMU_WAKEUP(HSI0));
+	else
+		prcmu_enable_wakeups(PRCMU_WAKEUP(ARM) | PRCMU_WAKEUP(RTC) |
+				     PRCMU_WAKEUP(ABB));
 
 	nmk_gpio_wakeups_resume();
 
@@ -224,13 +191,19 @@ static int ux500_suspend_enter(suspend_state_t state)
 	}
 
 	ux500_suspend_dbg_add_wake_on_uart();
-
-	ux500_pm_prcmu_set_ioforce(true);
+	/*
+	 * Set IOFORCE in order to wake on GPIO the same way
+	 * as in deeper sleep.
+	 * (U5500 is not ready for IOFORCE)
+	 */
+	if (!cpu_is_u5500())
+		ux500_pm_prcmu_set_ioforce(true);
 
 	dsb();
 	__asm__ __volatile__("wfi\n\t" : : : "memory");
 
-	ux500_pm_prcmu_set_ioforce(false);
+	if (!cpu_is_u5500())
+		ux500_pm_prcmu_set_ioforce(false);
 	ux500_suspend_dbg_remove_wake_on_uart();
 
 	return 0;
@@ -276,21 +249,16 @@ static void ux500_suspend_finish(void)
 
 static int ux500_suspend_begin(suspend_state_t state)
 {
-	(void) prcmu_qos_update_requirement(PRCMU_QOS_ARM_KHZ,
-					    "suspend",
-					    PRCMU_QOS_ARM_KHZ_MAX);
-	suspend_ongoing = true;
-
+	(void) prcmu_qos_update_requirement(PRCMU_QOS_ARM_OPP,
+					    "suspend", 125);
 	suspend_state = state;
 	return ux500_suspend_dbg_begin(state);
 }
 
 static void ux500_suspend_end(void)
 {
-	(void) prcmu_qos_update_requirement(PRCMU_QOS_ARM_KHZ,
-					    "suspend",
-					    PRCMU_QOS_DEFAULT_VALUE);
-	suspend_ongoing = false;
+	(void) prcmu_qos_update_requirement(PRCMU_QOS_ARM_OPP,
+					    "suspend", 25);
 	suspend_state = PM_SUSPEND_ON;
 
 	ux500_suspend_dbg_end();
@@ -309,21 +277,8 @@ static struct platform_suspend_ops ux500_suspend_ops = {
 
 static __init int ux500_suspend_init(void)
 {
-	if (cpu_is_u9500()) {
-		suspend_wakeups = (PRCMU_WAKEUP(ABB) | PRCMU_WAKEUP(RTC) |
-				   PRCMU_WAKEUP(HSI0));
-		running_wakeups = (PRCMU_WAKEUP(ARM) | PRCMU_WAKEUP(RTC) |
-				   PRCMU_WAKEUP(ABB) | PRCMU_WAKEUP(HSI0));
-	} else {
-		suspend_wakeups = PRCMU_WAKEUP(ABB) | PRCMU_WAKEUP(RTC);
-		running_wakeups = (PRCMU_WAKEUP(ARM) | PRCMU_WAKEUP(RTC) |
-				   PRCMU_WAKEUP(ABB));
-	}
-
 	ux500_suspend_dbg_init();
-	prcmu_qos_add_requirement(PRCMU_QOS_ARM_KHZ,
-				  "suspend",
-				  PRCMU_QOS_DEFAULT_VALUE);
+	prcmu_qos_add_requirement(PRCMU_QOS_ARM_OPP, "suspend", 25);
 	suspend_set_ops(&ux500_suspend_ops);
 	return 0;
 }

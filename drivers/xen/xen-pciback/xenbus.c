@@ -10,17 +10,32 @@
 #include <linux/workqueue.h>
 #include <xen/xenbus.h>
 #include <xen/events.h>
-#include <linux/workqueue.h>
+#include <asm/xen/pci.h>
 #include "pciback.h"
 
 #define INVALID_EVTCHN_IRQ  (-1)
-struct workqueue_struct *pciback_wq;
+struct workqueue_struct *xen_pcibk_wq;
 
-static struct pciback_device *alloc_pdev(struct xenbus_device *xdev)
+static bool __read_mostly passthrough;
+module_param(passthrough, bool, S_IRUGO);
+MODULE_PARM_DESC(passthrough,
+	"Option to specify how to export PCI topology to guest:\n"\
+	" 0 - (default) Hide the true PCI topology and makes the frontend\n"\
+	"   there is a single PCI bus with only the exported devices on it.\n"\
+	"   For example, a device at 03:05.0 will be re-assigned to 00:00.0\n"\
+	"   while second device at 02:1a.1 will be re-assigned to 00:01.1.\n"\
+	" 1 - Passthrough provides a real view of the PCI topology to the\n"\
+	"   frontend (for example, a device at 06:01.b will still appear at\n"\
+	"   06:01.b to the frontend). This is similar to how Xen 2.0.x\n"\
+	"   exposed PCI devices to its driver domains. This may be required\n"\
+	"   for drivers which depend on finding their hardward in certain\n"\
+	"   bus/slot locations.");
+
+static struct xen_pcibk_device *alloc_pdev(struct xenbus_device *xdev)
 {
-	struct pciback_device *pdev;
+	struct xen_pcibk_device *pdev;
 
-	pdev = kzalloc(sizeof(struct pciback_device), GFP_KERNEL);
+	pdev = kzalloc(sizeof(struct xen_pcibk_device), GFP_KERNEL);
 	if (pdev == NULL)
 		goto out;
 	dev_dbg(&xdev->dev, "allocated pdev @ 0x%p\n", pdev);
@@ -28,15 +43,15 @@ static struct pciback_device *alloc_pdev(struct xenbus_device *xdev)
 	pdev->xdev = xdev;
 	dev_set_drvdata(&xdev->dev, pdev);
 
-	spin_lock_init(&pdev->dev_lock);
+	mutex_init(&pdev->dev_lock);
 
 	pdev->sh_info = NULL;
 	pdev->evtchn_irq = INVALID_EVTCHN_IRQ;
 	pdev->be_watching = 0;
 
-	INIT_WORK(&pdev->op_work, pciback_do_op);
+	INIT_WORK(&pdev->op_work, xen_pcibk_do_op);
 
-	if (pciback_init_devices(pdev)) {
+	if (xen_pcibk_init_devices(pdev)) {
 		kfree(pdev);
 		pdev = NULL;
 	}
@@ -44,10 +59,9 @@ out:
 	return pdev;
 }
 
-static void pciback_disconnect(struct pciback_device *pdev)
+static void xen_pcibk_disconnect(struct xen_pcibk_device *pdev)
 {
-	spin_lock(&pdev->dev_lock);
-
+	mutex_lock(&pdev->dev_lock);
 	/* Ensure the guest can't trigger our handler before removing devices */
 	if (pdev->evtchn_irq != INVALID_EVTCHN_IRQ) {
 		unbind_from_irqhandler(pdev->evtchn_irq, pdev);
@@ -56,24 +70,27 @@ static void pciback_disconnect(struct pciback_device *pdev)
 
 	/* If the driver domain started an op, make sure we complete it
 	 * before releasing the shared memory */
-	flush_workqueue(pciback_wq);
+
+	/* Note, the workqueue does not use spinlocks at all.*/
+	flush_workqueue(xen_pcibk_wq);
 
 	if (pdev->sh_info != NULL) {
 		xenbus_unmap_ring_vfree(pdev->xdev, pdev->sh_info);
 		pdev->sh_info = NULL;
 	}
-
-	spin_unlock(&pdev->dev_lock);
+	mutex_unlock(&pdev->dev_lock);
 }
 
-static void free_pdev(struct pciback_device *pdev)
+static void free_pdev(struct xen_pcibk_device *pdev)
 {
-	if (pdev->be_watching)
+	if (pdev->be_watching) {
 		unregister_xenbus_watch(&pdev->be_watch);
+		pdev->be_watching = 0;
+	}
 
-	pciback_disconnect(pdev);
+	xen_pcibk_disconnect(pdev);
 
-	pciback_release_devices(pdev);
+	xen_pcibk_release_devices(pdev);
 
 	dev_set_drvdata(&pdev->xdev->dev, NULL);
 	pdev->xdev = NULL;
@@ -81,7 +98,7 @@ static void free_pdev(struct pciback_device *pdev)
 	kfree(pdev);
 }
 
-static int pciback_do_attach(struct pciback_device *pdev, int gnt_ref,
+static int xen_pcibk_do_attach(struct xen_pcibk_device *pdev, int gnt_ref,
 			     int remote_evtchn)
 {
 	int err = 0;
@@ -97,11 +114,12 @@ static int pciback_do_attach(struct pciback_device *pdev, int gnt_ref,
 				"Error mapping other domain page in ours.");
 		goto out;
 	}
+
 	pdev->sh_info = vaddr;
 
 	err = bind_interdomain_evtchn_to_irqhandler(
-		pdev->xdev->otherend_id, remote_evtchn, pciback_handle_event,
-		0, "pciback", pdev);
+		pdev->xdev->otherend_id, remote_evtchn, xen_pcibk_handle_event,
+		0, DRV_NAME, pdev);
 	if (err < 0) {
 		xenbus_dev_fatal(pdev->xdev, err,
 				 "Error binding event channel to IRQ");
@@ -115,14 +133,14 @@ out:
 	return err;
 }
 
-static int pciback_attach(struct pciback_device *pdev)
+static int xen_pcibk_attach(struct xen_pcibk_device *pdev)
 {
 	int err = 0;
 	int gnt_ref, remote_evtchn;
 	char *magic = NULL;
 
-	spin_lock(&pdev->dev_lock);
 
+	mutex_lock(&pdev->dev_lock);
 	/* Make sure we only do this setup once */
 	if (xenbus_read_driver_state(pdev->xdev->nodename) !=
 	    XenbusStateInitialised)
@@ -149,12 +167,12 @@ static int pciback_attach(struct pciback_device *pdev)
 	if (magic == NULL || strcmp(magic, XEN_PCI_MAGIC) != 0) {
 		xenbus_dev_fatal(pdev->xdev, -EFAULT,
 				 "version mismatch (%s/%s) with pcifront - "
-				 "halting pciback",
+				 "halting " DRV_NAME,
 				 magic, XEN_PCI_MAGIC);
 		goto out;
 	}
 
-	err = pciback_do_attach(pdev, gnt_ref, remote_evtchn);
+	err = xen_pcibk_do_attach(pdev, gnt_ref, remote_evtchn);
 	if (err)
 		goto out;
 
@@ -167,14 +185,14 @@ static int pciback_attach(struct pciback_device *pdev)
 
 	dev_dbg(&pdev->xdev->dev, "Connected? %d\n", err);
 out:
-	spin_unlock(&pdev->dev_lock);
+	mutex_unlock(&pdev->dev_lock);
 
 	kfree(magic);
 
 	return err;
 }
 
-static int pciback_publish_pci_dev(struct pciback_device *pdev,
+static int xen_pcibk_publish_pci_dev(struct xen_pcibk_device *pdev,
 				   unsigned int domain, unsigned int bus,
 				   unsigned int devfn, unsigned int devid)
 {
@@ -188,6 +206,7 @@ static int pciback_publish_pci_dev(struct pciback_device *pdev,
 		goto out;
 	}
 
+	/* Note: The PV protocol uses %02x, don't change it */
 	err = xenbus_printf(XBT_NIL, pdev->xdev->nodename, str,
 			    "%04x:%02x:%02x.%02x", domain, bus,
 			    PCI_SLOT(devfn), PCI_FUNC(devfn));
@@ -196,7 +215,7 @@ out:
 	return err;
 }
 
-static int pciback_export_device(struct pciback_device *pdev,
+static int xen_pcibk_export_device(struct xen_pcibk_device *pdev,
 				 int domain, int bus, int slot, int func,
 				 int devid)
 {
@@ -211,15 +230,25 @@ static int pciback_export_device(struct pciback_device *pdev,
 		err = -EINVAL;
 		xenbus_dev_fatal(pdev->xdev, err,
 				 "Couldn't locate PCI device "
-				 "(%04x:%02x:%02x.%01x)! "
+				 "(%04x:%02x:%02x.%d)! "
 				 "perhaps already in-use?",
 				 domain, bus, slot, func);
 		goto out;
 	}
 
-	err = pciback_add_pci_dev(pdev, dev, devid, pciback_publish_pci_dev);
+	err = xen_pcibk_add_pci_dev(pdev, dev, devid,
+				    xen_pcibk_publish_pci_dev);
 	if (err)
 		goto out;
+
+	dev_dbg(&dev->dev, "registering for %d\n", pdev->xdev->otherend_id);
+	if (xen_register_device_domain_owner(dev,
+					     pdev->xdev->otherend_id) != 0) {
+		dev_err(&dev->dev, "Stealing ownership from dom%d.\n",
+			xen_find_device_domain_owner(dev));
+		xen_unregister_device_domain_owner(dev);
+		xen_register_device_domain_owner(dev, pdev->xdev->otherend_id);
+	}
 
 	/* TODO: It'd be nice to export a bridge and have all of its children
 	 * get exported with it. This may be best done in xend (which will
@@ -233,7 +262,7 @@ out:
 	return err;
 }
 
-static int pciback_remove_device(struct pciback_device *pdev,
+static int xen_pcibk_remove_device(struct xen_pcibk_device *pdev,
 				 int domain, int bus, int slot, int func)
 {
 	int err = 0;
@@ -242,22 +271,25 @@ static int pciback_remove_device(struct pciback_device *pdev,
 	dev_dbg(&pdev->xdev->dev, "removing dom %x bus %x slot %x func %x\n",
 		domain, bus, slot, func);
 
-	dev = pciback_get_pci_dev(pdev, domain, bus, PCI_DEVFN(slot, func));
+	dev = xen_pcibk_get_pci_dev(pdev, domain, bus, PCI_DEVFN(slot, func));
 	if (!dev) {
 		err = -EINVAL;
 		dev_dbg(&pdev->xdev->dev, "Couldn't locate PCI device "
-			"(%04x:%02x:%02x.%01x)! not owned by this domain\n",
+			"(%04x:%02x:%02x.%d)! not owned by this domain\n",
 			domain, bus, slot, func);
 		goto out;
 	}
 
-	pciback_release_pci_dev(pdev, dev);
+	dev_dbg(&dev->dev, "unregistering for %d\n", pdev->xdev->otherend_id);
+	xen_unregister_device_domain_owner(dev);
+
+	xen_pcibk_release_pci_dev(pdev, dev);
 
 out:
 	return err;
 }
 
-static int pciback_publish_pci_root(struct pciback_device *pdev,
+static int xen_pcibk_publish_pci_root(struct xen_pcibk_device *pdev,
 				    unsigned int domain, unsigned int bus)
 {
 	unsigned int d, b;
@@ -317,7 +349,7 @@ out:
 	return err;
 }
 
-static int pciback_reconfigure(struct pciback_device *pdev)
+static int xen_pcibk_reconfigure(struct xen_pcibk_device *pdev)
 {
 	int err = 0;
 	int num_devs;
@@ -327,10 +359,10 @@ static int pciback_reconfigure(struct pciback_device *pdev)
 	char state_str[64];
 	char dev_str[64];
 
-	spin_lock(&pdev->dev_lock);
 
 	dev_dbg(&pdev->xdev->dev, "Reconfiguring device ...\n");
 
+	mutex_lock(&pdev->dev_lock);
 	/* Make sure we only reconfigure once */
 	if (xenbus_read_driver_state(pdev->xdev->nodename) !=
 	    XenbusStateReconfiguring)
@@ -389,14 +421,14 @@ static int pciback_reconfigure(struct pciback_device *pdev)
 				goto out;
 			}
 
-			err = pciback_export_device(pdev, domain, bus, slot,
+			err = xen_pcibk_export_device(pdev, domain, bus, slot,
 						    func, i);
 			if (err)
 				goto out;
 
 			/* Publish pci roots. */
-			err = pciback_publish_pci_roots(pdev,
-						pciback_publish_pci_root);
+			err = xen_pcibk_publish_pci_roots(pdev,
+						xen_pcibk_publish_pci_root);
 			if (err) {
 				xenbus_dev_fatal(pdev->xdev, err,
 						 "Error while publish PCI root"
@@ -443,7 +475,7 @@ static int pciback_reconfigure(struct pciback_device *pdev)
 				goto out;
 			}
 
-			err = pciback_remove_device(pdev, domain, bus, slot,
+			err = xen_pcibk_remove_device(pdev, domain, bus, slot,
 						    func);
 			if (err)
 				goto out;
@@ -468,25 +500,24 @@ static int pciback_reconfigure(struct pciback_device *pdev)
 	}
 
 out:
-	spin_unlock(&pdev->dev_lock);
-
+	mutex_unlock(&pdev->dev_lock);
 	return 0;
 }
 
-static void pciback_frontend_changed(struct xenbus_device *xdev,
+static void xen_pcibk_frontend_changed(struct xenbus_device *xdev,
 				     enum xenbus_state fe_state)
 {
-	struct pciback_device *pdev = dev_get_drvdata(&xdev->dev);
+	struct xen_pcibk_device *pdev = dev_get_drvdata(&xdev->dev);
 
 	dev_dbg(&xdev->dev, "fe state changed %d\n", fe_state);
 
 	switch (fe_state) {
 	case XenbusStateInitialised:
-		pciback_attach(pdev);
+		xen_pcibk_attach(pdev);
 		break;
 
 	case XenbusStateReconfiguring:
-		pciback_reconfigure(pdev);
+		xen_pcibk_reconfigure(pdev);
 		break;
 
 	case XenbusStateConnected:
@@ -497,12 +528,12 @@ static void pciback_frontend_changed(struct xenbus_device *xdev,
 		break;
 
 	case XenbusStateClosing:
-		pciback_disconnect(pdev);
+		xen_pcibk_disconnect(pdev);
 		xenbus_switch_state(xdev, XenbusStateClosing);
 		break;
 
 	case XenbusStateClosed:
-		pciback_disconnect(pdev);
+		xen_pcibk_disconnect(pdev);
 		xenbus_switch_state(xdev, XenbusStateClosed);
 		if (xenbus_dev_is_online(xdev))
 			break;
@@ -517,7 +548,7 @@ static void pciback_frontend_changed(struct xenbus_device *xdev,
 	}
 }
 
-static int pciback_setup_backend(struct pciback_device *pdev)
+static int xen_pcibk_setup_backend(struct xen_pcibk_device *pdev)
 {
 	/* Get configuration from xend (if available now) */
 	int domain, bus, slot, func;
@@ -526,8 +557,7 @@ static int pciback_setup_backend(struct pciback_device *pdev)
 	char dev_str[64];
 	char state_str[64];
 
-	spin_lock(&pdev->dev_lock);
-
+	mutex_lock(&pdev->dev_lock);
 	/* It's possible we could get the call to setup twice, so make sure
 	 * we're not already connected.
 	 */
@@ -572,7 +602,7 @@ static int pciback_setup_backend(struct pciback_device *pdev)
 			goto out;
 		}
 
-		err = pciback_export_device(pdev, domain, bus, slot, func, i);
+		err = xen_pcibk_export_device(pdev, domain, bus, slot, func, i);
 		if (err)
 			goto out;
 
@@ -594,7 +624,7 @@ static int pciback_setup_backend(struct pciback_device *pdev)
 		}
 	}
 
-	err = pciback_publish_pci_roots(pdev, pciback_publish_pci_root);
+	err = xen_pcibk_publish_pci_roots(pdev, xen_pcibk_publish_pci_root);
 	if (err) {
 		xenbus_dev_fatal(pdev->xdev, err,
 				 "Error while publish PCI root buses "
@@ -608,24 +638,22 @@ static int pciback_setup_backend(struct pciback_device *pdev)
 				 "Error switching to initialised state!");
 
 out:
-	spin_unlock(&pdev->dev_lock);
-
+	mutex_unlock(&pdev->dev_lock);
 	if (!err)
 		/* see if pcifront is already configured (if not, we'll wait) */
-		pciback_attach(pdev);
-
+		xen_pcibk_attach(pdev);
 	return err;
 }
 
-static void pciback_be_watch(struct xenbus_watch *watch,
+static void xen_pcibk_be_watch(struct xenbus_watch *watch,
 			     const char **vec, unsigned int len)
 {
-	struct pciback_device *pdev =
-	    container_of(watch, struct pciback_device, be_watch);
+	struct xen_pcibk_device *pdev =
+	    container_of(watch, struct xen_pcibk_device, be_watch);
 
 	switch (xenbus_read_driver_state(pdev->xdev->nodename)) {
 	case XenbusStateInitWait:
-		pciback_setup_backend(pdev);
+		xen_pcibk_setup_backend(pdev);
 		break;
 
 	default:
@@ -633,16 +661,16 @@ static void pciback_be_watch(struct xenbus_watch *watch,
 	}
 }
 
-static int pciback_xenbus_probe(struct xenbus_device *dev,
+static int xen_pcibk_xenbus_probe(struct xenbus_device *dev,
 				const struct xenbus_device_id *id)
 {
 	int err = 0;
-	struct pciback_device *pdev = alloc_pdev(dev);
+	struct xen_pcibk_device *pdev = alloc_pdev(dev);
 
 	if (pdev == NULL) {
 		err = -ENOMEM;
 		xenbus_dev_fatal(dev, err,
-				 "Error allocating pciback_device struct");
+				 "Error allocating xen_pcibk_device struct");
 		goto out;
 	}
 
@@ -653,23 +681,24 @@ static int pciback_xenbus_probe(struct xenbus_device *dev,
 
 	/* watch the backend node for backend configuration information */
 	err = xenbus_watch_path(dev, dev->nodename, &pdev->be_watch,
-				pciback_be_watch);
+				xen_pcibk_be_watch);
 	if (err)
 		goto out;
+
 	pdev->be_watching = 1;
 
 	/* We need to force a call to our callback here in case
 	 * xend already configured us!
 	 */
-	pciback_be_watch(&pdev->be_watch, NULL, 0);
+	xen_pcibk_be_watch(&pdev->be_watch, NULL, 0);
 
 out:
 	return err;
 }
 
-static int pciback_xenbus_remove(struct xenbus_device *dev)
+static int xen_pcibk_xenbus_remove(struct xenbus_device *dev)
 {
-	struct pciback_device *pdev = dev_get_drvdata(&dev->dev);
+	struct xen_pcibk_device *pdev = dev_get_drvdata(&dev->dev);
 
 	if (pdev != NULL)
 		free_pdev(pdev);
@@ -677,33 +706,36 @@ static int pciback_xenbus_remove(struct xenbus_device *dev)
 	return 0;
 }
 
-static const struct xenbus_device_id xenpci_ids[] = {
+static const struct xenbus_device_id xen_pcibk_ids[] = {
 	{"pci"},
 	{""},
 };
 
-static struct xenbus_driver xenbus_pciback_driver = {
-	.name 			= "pciback",
-	.owner 			= THIS_MODULE,
-	.ids 			= xenpci_ids,
-	.probe 			= pciback_xenbus_probe,
-	.remove 		= pciback_xenbus_remove,
-	.otherend_changed 	= pciback_frontend_changed,
-};
+static DEFINE_XENBUS_DRIVER(xen_pcibk, DRV_NAME,
+	.probe			= xen_pcibk_xenbus_probe,
+	.remove			= xen_pcibk_xenbus_remove,
+	.otherend_changed	= xen_pcibk_frontend_changed,
+);
 
-int __init pciback_xenbus_register(void)
+const struct xen_pcibk_backend *__read_mostly xen_pcibk_backend;
+
+int __init xen_pcibk_xenbus_register(void)
 {
-	pciback_wq = create_workqueue("pciback_workqueue");
-	if (!pciback_wq) {
-		printk(KERN_ERR "pciback_xenbus_register: create"
-			"pciback_workqueue failed\n");
+	xen_pcibk_wq = create_workqueue("xen_pciback_workqueue");
+	if (!xen_pcibk_wq) {
+		printk(KERN_ERR "%s: create"
+			"xen_pciback_workqueue failed\n", __func__);
 		return -EFAULT;
 	}
-	return xenbus_register_backend(&xenbus_pciback_driver);
+	xen_pcibk_backend = &xen_pcibk_vpci_backend;
+	if (passthrough)
+		xen_pcibk_backend = &xen_pcibk_passthrough_backend;
+	pr_info(DRV_NAME ": backend is %s\n", xen_pcibk_backend->name);
+	return xenbus_register_backend(&xen_pcibk_driver);
 }
 
-void __exit pciback_xenbus_unregister(void)
+void __exit xen_pcibk_xenbus_unregister(void)
 {
-	destroy_workqueue(pciback_wq);
-	xenbus_unregister_driver(&xenbus_pciback_driver);
+	destroy_workqueue(xen_pcibk_wq);
+	xenbus_unregister_driver(&xen_pcibk_driver);
 }

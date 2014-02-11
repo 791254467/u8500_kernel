@@ -11,9 +11,8 @@
 #include <linux/init.h>
 #include <linux/delay.h>
 #include <linux/gpio.h>
+#include <linux/gpio/nomadik.h>
 #include <linux/mfd/dbx500-prcmu.h>
-
-#include <plat/gpio-nomadik.h>
 
 #include <asm/hardware/gic.h>
 #include <asm/processor.h>
@@ -122,7 +121,7 @@ bool ux500_pm_gic_pending_interrupt(void)
 }
 
 #define GIC_NUMBER_SPI_REGS 4
-bool ux500_pm_prcmu_pending_interrupt(u32 *pending_irq)
+bool ux500_pm_prcmu_pending_interrupt(void)
 {
 	u32 it;
 	u32 im;
@@ -133,11 +132,8 @@ bool ux500_pm_prcmu_pending_interrupt(u32 *pending_irq)
 		it = prcmu_read(PRCM_ARMITVAL31TO0 + i * 4);
 		im = prcmu_read(PRCM_ARMITMSK31TO0 + i * 4);
 
-		if (it & im) { /* Return first pending interrupt */
-			if (pending_irq)
-				*pending_irq = i * 32 + __ffs(it & im);
-			return true;
-		}
+		if (it & im)
+			return true; /* There is a pending interrupt */
 	}
 
 	return false;
@@ -186,11 +182,6 @@ void ux500_pm_gpio_save_wake_up_status(void)
 
 	for (i = 0; i < num_banks; i++)
 		ux500_gpio_wks[i] = readl(__io_address(banks[i]) + NMK_GPIO_WKS);
-
-	// if gpio cause wakeup, then print wakeup status.
-	for (i = 0; i < num_banks; i++)
-		if(ux500_gpio_wks[i])	printk(KERN_INFO "%s: bank%d: 0x%08x\n",
-				__func__, i, ux500_gpio_wks[i]);
 
 	nmk_gpio_clocks_disable();
 }

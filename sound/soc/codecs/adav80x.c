@@ -456,7 +456,7 @@ static int adav80x_set_capture_pcm_format(struct snd_soc_codec *codec,
 		val = ADAV80X_CAPTURE_WORD_LEN24;
 		break;
 	default:
-		break;
+		return -EINVAL;
 	}
 
 	snd_soc_update_bits(codec, adav80x_port_ctrl_regs[dai->id][0],
@@ -488,7 +488,7 @@ static int adav80x_set_playback_pcm_format(struct snd_soc_codec *codec,
 		val = ADAV80X_PLAYBACK_MODE_RIGHT_J_24;
 		break;
 	default:
-		break;
+		return -EINVAL;
 	}
 
 	snd_soc_update_bits(codec, adav80x_port_ctrl_regs[dai->id][1],
@@ -523,7 +523,8 @@ static int adav80x_hw_params(struct snd_pcm_substream *substream,
 }
 
 static int adav80x_set_sysclk(struct snd_soc_codec *codec,
-		int clk_id, unsigned int freq, int dir)
+			      int clk_id, int source,
+			      unsigned int freq, int dir)
 {
 	struct adav80x *adav80x = snd_soc_codec_get_drvdata(codec);
 
@@ -797,7 +798,7 @@ static int adav80x_probe(struct snd_soc_codec *codec)
 	return adav80x_set_bias_level(codec, SND_SOC_BIAS_STANDBY);
 }
 
-static int adav80x_suspend(struct snd_soc_codec *codec, pm_message_t state)
+static int adav80x_suspend(struct snd_soc_codec *codec)
 {
 	return adav80x_set_bias_level(codec, SND_SOC_BIAS_OFF);
 }

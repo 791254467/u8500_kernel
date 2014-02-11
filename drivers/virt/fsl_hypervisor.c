@@ -37,6 +37,7 @@
 #include <linux/reboot.h>
 #include <linux/uaccess.h>
 #include <linux/notifier.h>
+#include <linux/interrupt.h>
 
 #include <linux/io.h>
 #include <asm/fsl_hcalls.h>
@@ -705,6 +706,7 @@ static const struct file_operations fsl_hv_fops = {
 	.poll = fsl_hv_poll,
 	.read = fsl_hv_read,
 	.unlocked_ioctl = fsl_hv_ioctl,
+	.compat_ioctl = fsl_hv_ioctl,
 };
 
 static struct miscdevice fsl_hv_misc_dev = {

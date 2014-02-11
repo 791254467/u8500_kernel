@@ -11,6 +11,7 @@
 #include <linux/platform_device.h>
 #include <linux/input.h>
 #include <linux/interrupt.h>
+#include <linux/mfd/abx500/ab8500.h>
 #include <linux/slab.h>
 #include <linux/mfd/abx500.h>
 #include <linux/mfd/abx500/ab5500.h>
@@ -22,8 +23,6 @@
 #define AB5500_PONKEY_DISABLE	0x2
 #define AB5500_PONKEY_TMR_MASK	0x1
 #define AB5500_PONKEY_TR_MASK	0x2
-
-extern struct class *sec_class;
 
 static int ab5500_ponkey_hw_init(struct platform_device *);
 
@@ -52,20 +51,9 @@ static const struct ab8500_ponkey_variant ab8500_ponkey = {
  */
 struct ab8500_ponkey_info {
 	struct input_dev	*idev;
-	struct device *sec_power_key;
 	int			irq_dbf;
 	int			irq_dbr;
-	bool		key_state;
-	bool		pcut_wa;
-	struct delayed_work	pcut_work;
-	u8			pcut_ctrl;
 };
-
-#ifndef CONFIG_SAMSUNG_PRODUCT_SHIP
-extern bool gpio_keys_getstate(int keycode);
-extern int jack_is_detected;
-#endif
-extern void gpio_keys_setstate(int keycode, bool bState);
 
 static int ab5500_ponkey_hw_init(struct platform_device *pdev)
 {
@@ -98,74 +86,15 @@ static int ab5500_ponkey_hw_init(struct platform_device *pdev)
 		val);
 }
 
-static ssize_t power_key_pressed_show(struct device *dev,
-				struct device_attribute *attr, char *buf)
-{
-	struct ab8500_ponkey_info *info = dev_get_drvdata(dev);
-	int keystate = 0;
-
-	keystate = info->key_state;
-
-	if (keystate)
-		sprintf(buf, "PRESS");
-	else
-		sprintf(buf, "RELEASE");
-
-	return strlen(buf);
-}
-
-static DEVICE_ATTR(sec_power_key_pressed, 0664, power_key_pressed_show, NULL);
-
-static struct attribute *sec_power_key_attrs[] = {
-	&dev_attr_sec_power_key_pressed.attr,
-	NULL,
-};
-
-static struct attribute_group sec_power_key_attr_group = {
-	.attrs = sec_power_key_attrs,
-};
-
-#define PCUT_CTR_AND_STATUS 0x12
-
-static void pcut_disable(struct work_struct *work)
-{
-	struct delayed_work *dwork = to_delayed_work(work);
-	struct ab8500_ponkey_info *info = container_of(dwork,
-				struct ab8500_ponkey_info, pcut_work);
-	struct device *dev = info->idev->dev.parent;
-
-	abx500_get(dev, AB8500_RTC, PCUT_CTR_AND_STATUS, &info->pcut_ctrl);
-	abx500_set(dev, AB8500_RTC, PCUT_CTR_AND_STATUS, 0);
-}
-
 /* AB8500 gives us an interrupt when ONKEY is held */
 static irqreturn_t ab8500_ponkey_handler(int irq, void *data)
 {
 	struct ab8500_ponkey_info *info = data;
 
-	if (irq == info->irq_dbf) {
-		if (info->pcut_wa)
-			schedule_delayed_work(&info->pcut_work, HZ * 1);
-
-		gpio_keys_setstate(KEY_POWER, true);
-		info->key_state = true;
+	if (irq == info->irq_dbf)
 		input_report_key(info->idev, KEY_POWER, true);
-#if !defined(CONFIG_SAMSUNG_PRODUCT_SHIP)
-		dev_info(info->idev->dev.parent, "Power KEY pressed %d\n", KEY_POWER);
-#endif
-	} else if (irq == info->irq_dbr) {
-		if (info->pcut_wa && !cancel_delayed_work_sync(&info->pcut_work))
-			abx500_set(info->idev->dev.parent, AB8500_RTC,
-				   PCUT_CTR_AND_STATUS, info->pcut_ctrl);
-
-		gpio_keys_setstate(KEY_POWER, false);
-		info->key_state = false;
+	else if (irq == info->irq_dbr)
 		input_report_key(info->idev, KEY_POWER, false);
-#if !defined(CONFIG_SAMSUNG_PRODUCT_SHIP)
-		dev_info(info->idev->dev.parent, "Power KEY released %d\n", KEY_POWER);
-#endif
-
-	}
 
 	input_sync(info->idev);
 
@@ -174,7 +103,6 @@ static irqreturn_t ab8500_ponkey_handler(int irq, void *data)
 
 static int __devinit ab8500_ponkey_probe(struct platform_device *pdev)
 {
-	struct ab8500 *ab8500 = dev_get_drvdata(pdev->dev.parent);
 	const struct ab8500_ponkey_variant *variant;
 	struct ab8500_ponkey_info *info;
 	int irq_dbf, irq_dbr, ret;
@@ -208,12 +136,6 @@ static int __devinit ab8500_ponkey_probe(struct platform_device *pdev)
 	if (!info)
 		return -ENOMEM;
 
-	if ((is_ab8505(ab8500) || is_ab9540(ab8500))
-	     && abx500_get_chip_id(&pdev->dev) >= AB8500_CUT2P0)
-		info->pcut_wa = true;
-
-	INIT_DELAYED_WORK(&info->pcut_work, pcut_disable);
-
 	info->irq_dbf = irq_dbf;
 	info->irq_dbr = irq_dbr;
 
@@ -228,17 +150,6 @@ static int __devinit ab8500_ponkey_probe(struct platform_device *pdev)
 	info->idev->dev.parent = &pdev->dev;
 	info->idev->evbit[0] = BIT_MASK(EV_KEY);
 	info->idev->keybit[BIT_WORD(KEY_POWER)] = BIT_MASK(KEY_POWER);
-
-
-	info->sec_power_key = device_create(sec_class, NULL, 0, info, "sec_power_key");
-	if (IS_ERR(info->sec_power_key))
-		dev_err(&pdev->dev, "Failed to create sec_power_key device\n");
-
-	ret = sysfs_create_group(&info->sec_power_key->kobj, &sec_power_key_attr_group);
-	if (ret) {
-		dev_err(&pdev->dev, "Unable to export sec_power_key device: %d\n", ret);
-		goto out;
-	}
 
 	ret = input_register_device(info->idev);
 	if (ret) {
@@ -275,7 +186,6 @@ out_unregisterdevice:
 	info->idev = NULL;
 out_unfreedevice:
 	input_free_device(info->idev);
-	sysfs_remove_group(&info->sec_power_key->kobj, &sec_power_key_attr_group);
 out:
 	kfree(info);
 	return ret;
@@ -308,18 +218,7 @@ static struct platform_driver ab8500_ponkey_driver = {
 	.probe		= ab8500_ponkey_probe,
 	.remove		= __devexit_p(ab8500_ponkey_remove),
 };
-
-static int __init ab8500_ponkey_init(void)
-{
-	return platform_driver_register(&ab8500_ponkey_driver);
-}
-module_init(ab8500_ponkey_init);
-
-static void __exit ab8500_ponkey_exit(void)
-{
-	platform_driver_unregister(&ab8500_ponkey_driver);
-}
-module_exit(ab8500_ponkey_exit);
+module_platform_driver(ab8500_ponkey_driver);
 
 MODULE_LICENSE("GPL v2");
 MODULE_AUTHOR("Sundar Iyer <sundar.iyer@stericsson.com>");

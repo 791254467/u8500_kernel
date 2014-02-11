@@ -7,21 +7,14 @@
  *
  *  Host driver specific definitions.
  */
-
-#if defined(CONFIG_MACH_JANICE) || defined(CONFIG_MACH_SEC_KYLE) || defined(CONFIG_MACH_CODINA)
-#define _MMC_SAFE_ACCESS_
-#endif
-
-#ifdef _MMC_SAFE_ACCESS_
-extern int mmc_is_available;
-#endif
- 
 #ifndef LINUX_MMC_HOST_H
 #define LINUX_MMC_HOST_H
 
 #include <linux/leds.h>
 #include <linux/sched.h>
+#include <linux/device.h>
 #include <linux/fault-inject.h>
+#include <linux/wakelock.h>
 
 #include <linux/mmc/core.h>
 #include <linux/mmc/pm.h>
@@ -107,13 +100,6 @@ struct mmc_host_ops {
 	void	(*pre_req)(struct mmc_host *host, struct mmc_request *req,
 			   bool is_first_req);
 	void	(*request)(struct mmc_host *host, struct mmc_request *req);
-	void    (*dump_regs)(struct mmc_host *host);
-	/*
-	 * The host should terminate the ongoing request along with any
-	 * active DMA transfer and reset the IP block, if possible. This
-	 * function is optional for the host to implement.
-	 */
-	void	(*abort_request)(struct mmc_host *host);
 	/*
 	 * Avoid calling these three functions too often or in a "fast path",
 	 * since underlaying controller might implement them in an expensive
@@ -253,7 +239,6 @@ struct mmc_host {
 #define MMC_CAP2_BROKEN_VOLTAGE	(1 << 7)	/* Use the broken voltage */
 #define MMC_CAP2_DETECT_ON_ERR	(1 << 8)	/* On I/O err check card removal */
 #define MMC_CAP2_HC_ERASE_SZ	(1 << 9)	/* High-capacity erase size */
-#define MMC_CAP2_SECURE_ERASE_EN (1 << 31)	
 
 	mmc_pm_flag_t		pm_caps;	/* supported pm features */
 	unsigned int        power_notify_type;
@@ -305,10 +290,11 @@ struct mmc_host {
 	int			claim_cnt;	/* "claim" nesting count */
 
 	struct delayed_work	detect;
-
-	struct delayed_work	resume;		/* deferred resume work */
+	struct wake_lock	detect_wake_lock;
 	int			detect_change;	/* card detect flag */
 	struct mmc_hotplug	hotplug;
+
+	struct delayed_work	resume;		/* deferred resume work */
 	unsigned int		pm_state;	/* used for deferred resume */
 #define MMC_HOST_DEFERRED_RESUME	(1 << 0)
 #define MMC_HOST_NEEDS_RESUME		(1 << 1)
@@ -316,9 +302,12 @@ struct mmc_host {
 	const struct mmc_bus_ops *bus_ops;	/* current bus driver */
 	unsigned int		bus_refs;	/* reference counter */
 
+	unsigned int		bus_resume_flags;
+#define MMC_BUSRESUME_MANUAL_RESUME	(1 << 0)
+#define MMC_BUSRESUME_NEEDS_RESUME	(1 << 1)
+
 	unsigned int		sdio_irqs;
 	struct task_struct	*sdio_irq_thread;
-	bool			sdio_irq_pending;
 	atomic_t		sdio_irq_thread_abort;
 
 	mmc_pm_flag_t		pm_flags;	/* requested pm features */
@@ -330,7 +319,6 @@ struct mmc_host {
 #ifdef CONFIG_REGULATOR
 	bool			regulator_enabled; /* regulator state */
 #endif
-	bool			abort_req;
 
 	struct dentry		*debugfs_root;
 
@@ -377,6 +365,18 @@ static inline void *mmc_priv(struct mmc_host *host)
 #define mmc_dev(x)	((x)->parent)
 #define mmc_classdev(x)	(&(x)->class_dev)
 #define mmc_hostname(x)	(dev_name(&(x)->class_dev))
+#define mmc_bus_needs_resume(host) ((host)->bus_resume_flags & MMC_BUSRESUME_NEEDS_RESUME)
+#define mmc_bus_manual_resume(host) ((host)->bus_resume_flags & MMC_BUSRESUME_MANUAL_RESUME)
+
+static inline void mmc_set_bus_resume_policy(struct mmc_host *host, int manual)
+{
+	if (manual)
+		host->bus_resume_flags |= MMC_BUSRESUME_MANUAL_RESUME;
+	else
+		host->bus_resume_flags &= ~MMC_BUSRESUME_MANUAL_RESUME;
+}
+
+extern int mmc_resume_bus(struct mmc_host *host);
 
 extern int mmc_suspend_host(struct mmc_host *);
 extern int mmc_resume_host(struct mmc_host *);
@@ -393,7 +393,6 @@ extern int mmc_cache_ctrl(struct mmc_host *, u8);
 static inline void mmc_signal_sdio_irq(struct mmc_host *host)
 {
 	host->ops->enable_sdio_irq(host, 0);
-	host->sdio_irq_pending = true;
 	wake_up_process(host->sdio_irq_thread);
 }
 
@@ -425,7 +424,7 @@ int mmc_card_can_sleep(struct mmc_host *host);
 int mmc_pm_notify(struct notifier_block *notify_block, unsigned long, void *);
 
 /* Module parameter */
-extern int mmc_assume_removable;
+extern bool mmc_assume_removable;
 
 static inline int mmc_card_is_removable(struct mmc_host *host)
 {
@@ -452,16 +451,6 @@ static inline int mmc_boot_partition_access(struct mmc_host *host)
 	return !(host->caps2 & MMC_CAP2_BOOTPART_NOACC);
 }
 
-static inline int mmc_host_deferred_resume(struct mmc_host *host)
-{
-	return host->pm_state & MMC_HOST_DEFERRED_RESUME;
-}
-
-static inline int mmc_host_needs_resume(struct mmc_host *host)
-{
-	return host->pm_state & MMC_HOST_NEEDS_RESUME;
-}
-
 #ifdef CONFIG_MMC_CLKGATE
 void mmc_host_clk_hold(struct mmc_host *host);
 void mmc_host_clk_release(struct mmc_host *host);
@@ -482,5 +471,14 @@ static inline unsigned int mmc_host_clk_rate(struct mmc_host *host)
 }
 #endif
 
-#endif
+static inline int mmc_host_deferred_resume(struct mmc_host *host)
+{
+	return host->pm_state & MMC_HOST_DEFERRED_RESUME;
+}
 
+static inline int mmc_host_needs_resume(struct mmc_host *host)
+{
+	return host->pm_state & MMC_HOST_NEEDS_RESUME;
+}
+
+#endif /* LINUX_MMC_HOST_H */

@@ -1316,21 +1316,18 @@ static int hw_pll_init(struct hw *hw, unsigned int rsr)
 
 	pllenb = 0xB;
 	hw_write_20kx(hw, PLL_ENB, pllenb);
-	pllctl = 0x20D00000;
-	set_field(&pllctl, PLLCTL_FD, 16 - 4);
-	hw_write_20kx(hw, PLL_CTL, pllctl);
-	mdelay(40);
-	pllctl = hw_read_20kx(hw, PLL_CTL);
+	pllctl = 0x20C00000;
 	set_field(&pllctl, PLLCTL_B, 0);
-	if (48000 == rsr) {
-		set_field(&pllctl, PLLCTL_FD, 16 - 2);
-		set_field(&pllctl, PLLCTL_RD, 1 - 1); /* 3000*16/1 = 48000 */
-	} else { /* 44100 */
-		set_field(&pllctl, PLLCTL_FD, 147 - 2);
-		set_field(&pllctl, PLLCTL_RD, 10 - 1); /* 3000*147/10 = 44100 */
-	}
+	set_field(&pllctl, PLLCTL_FD, 48000 == rsr ? 16 - 4 : 147 - 4);
+	set_field(&pllctl, PLLCTL_RD, 48000 == rsr ? 1 - 1 : 10 - 1);
 	hw_write_20kx(hw, PLL_CTL, pllctl);
 	mdelay(40);
+
+	pllctl = hw_read_20kx(hw, PLL_CTL);
+	set_field(&pllctl, PLLCTL_FD, 48000 == rsr ? 16 - 2 : 147 - 2);
+	hw_write_20kx(hw, PLL_CTL, pllctl);
+	mdelay(40);
+
 	for (i = 0; i < 1000; i++) {
 		pllstat = hw_read_20kx(hw, PLL_STAT);
 		if (get_field(pllstat, PLLSTAT_PD))
@@ -1915,19 +1912,16 @@ error:
 	return err;
 }
 
-static int hw_have_digit_io_switch(struct hw *hw)
+static struct capabilities hw_capabilities(struct hw *hw)
 {
-	return 0;
-}
+	struct capabilities cap;
 
-static int hw_have_dedicated_mic(struct hw *hw)
-{
-	return hw->model == CTSB1270;
-}
+	cap.digit_io_switch = 0;
+	cap.dedicated_mic = hw->model == CTSB1270;
+	cap.output_switch = hw->model == CTSB1270;
+	cap.mic_source_switch = hw->model == CTSB1270;
 
-static int hw_have_output_switch(struct hw *hw)
-{
-	return hw->model == CTSB1270;
+	return cap;
 }
 
 static int hw_output_switch_get(struct hw *hw)
@@ -1976,11 +1970,6 @@ static int hw_output_switch_put(struct hw *hw, int position)
 	hw_write_20kx(hw, GPIO_DATA, data);
 
 	return 1;
-}
-
-static int hw_have_mic_source_switch(struct hw *hw)
-{
-	return hw->model == CTSB1270;
 }
 
 static int hw_mic_source_switch_get(struct hw *hw)
@@ -2072,7 +2061,7 @@ static int hw_card_start(struct hw *hw)
 
 	if (hw->irq < 0) {
 		err = request_irq(pci->irq, ct_20k2_interrupt, IRQF_SHARED,
-				  "ctxfi", hw);
+				  KBUILD_MODNAME, hw);
 		if (err < 0) {
 			printk(KERN_ERR "XFi: Cannot get irq %d\n", pci->irq);
 			goto error2;
@@ -2256,12 +2245,9 @@ static struct hw ct20k2_preset __devinitdata = {
 	.pll_init = hw_pll_init,
 	.is_adc_source_selected = hw_is_adc_input_selected,
 	.select_adc_source = hw_adc_input_select,
-	.have_digit_io_switch = hw_have_digit_io_switch,
-	.have_dedicated_mic = hw_have_dedicated_mic,
-	.have_output_switch = hw_have_output_switch,
+	.capabilities = hw_capabilities,
 	.output_switch_get = hw_output_switch_get,
 	.output_switch_put = hw_output_switch_put,
-	.have_mic_source_switch = hw_have_mic_source_switch,
 	.mic_source_switch_get = hw_mic_source_switch_get,
 	.mic_source_switch_put = hw_mic_source_switch_put,
 #ifdef CONFIG_PM

@@ -847,7 +847,7 @@ static int iface_stat_fmt_proc_read(char *page, char **num_items_returned,
 			stats = &no_dev_stats;
 		}
 		/*
-		 * if the meaning of the data changes, then update the fmtx
+		 * If the meaning of the data changes, then update the fmtX
 		 * string.
 		 */
 		if (fmt == 1) {
@@ -2588,9 +2588,8 @@ static int pp_stats_line(struct proc_print_info *ppi, int cnt_set)
 	} else {
 		tag_t tag = ppi->ts_entry->tn.tag;
 		uid_t stat_uid = get_uid_from_tag(tag);
-		/* Detailed tags are not available to everybody */
-		if (get_atag_from_tag(tag)
-			&& !can_read_other_uid_stats(stat_uid)) {
+
+		if (!can_read_other_uid_stats(stat_uid)) {
 			CT_DEBUG("qtaguid: stats line: "
 				 "%s 0x%llx %u: insufficient priv "
 				 "from pid=%u tgid=%u uid=%u\n",

@@ -19,29 +19,6 @@
 #include <trace/events/irq.h>
 
 #include "internals.h"
-#ifdef CONFIG_SAMSUNG_KERNEL_DEBUG
-#ifdef CONFIG_SAMSUNG_LOG_BUF
-#include <mach/board-sec-ux500.h>
-#define IRQ_LOG_MAX 2000
-
-typedef struct {
-	unsigned long long time;
-	unsigned int id;
-	char cpu;
-	char ret;
-} irq_log_t;
-
-static irq_log_t * a_log_irq;
-
-static int log_idx = -1;
-void * log_buf_irq;
-EXPORT_SYMBOL(log_buf_irq);
-const int log_buf_irq_entry_size = sizeof(irq_log_t);
-EXPORT_SYMBOL(log_buf_irq_entry_size);
-const int log_buf_irq_entry_count = IRQ_LOG_MAX;
-EXPORT_SYMBOL(log_buf_irq_entry_count);
-#endif
-#endif /* CONFIG_SAMSUNG_KERNEL_DEBUG */
 
 /**
  * handle_bad_irq - handle spurious and unhandled irqs
@@ -77,14 +54,18 @@ static void warn_no_thread(unsigned int irq, struct irqaction *action)
 static void irq_wake_thread(struct irq_desc *desc, struct irqaction *action)
 {
 	/*
-	 * Wake up the handler thread for this action. In case the
-	 * thread crashed and was killed we just pretend that we
-	 * handled the interrupt. The hardirq handler has disabled the
-	 * device interrupt, so no irq storm is lurking. If the
+	 * In case the thread crashed and was killed we just pretend that
+	 * we handled the interrupt. The hardirq handler has disabled the
+	 * device interrupt, so no irq storm is lurking.
+	 */
+	if (action->thread->flags & PF_EXITING)
+		return;
+
+	/*
+	 * Wake up the handler thread for this action. If the
 	 * RUNTHREAD bit is already set, nothing to do.
 	 */
-	if (test_bit(IRQTF_DIED, &action->thread_flags) ||
-	    test_and_set_bit(IRQTF_RUNTHREAD, &action->thread_flags))
+	if (test_and_set_bit(IRQTF_RUNTHREAD, &action->thread_flags))
 		return;
 
 	/*
@@ -133,6 +114,18 @@ static void irq_wake_thread(struct irq_desc *desc, struct irqaction *action)
 	 * threads_oneshot untouched and runs the thread another time.
 	 */
 	desc->threads_oneshot |= action->thread_mask;
+
+	/*
+	 * We increment the threads_active counter in case we wake up
+	 * the irq thread. The irq thread decrements the counter when
+	 * it returns from the handler or in the exit path and wakes
+	 * up waiters which are stuck in synchronize_irq() when the
+	 * active count becomes zero. synchronize_irq() is serialized
+	 * against this code (hard irq handler) via IRQS_INPROGRESS
+	 * like the finalize_oneshot() code. See comment above.
+	 */
+	atomic_inc(&desc->threads_active);
+
 	wake_up_process(action->thread);
 }
 
@@ -140,48 +133,15 @@ irqreturn_t
 handle_irq_event_percpu(struct irq_desc *desc, struct irqaction *action)
 {
 	irqreturn_t retval = IRQ_NONE;
-	unsigned int flags = 0, irq = desc->irq_data.irq;
-#ifdef CONFIG_SAMSUNG_KERNEL_DEBUG
-	int cpu;
-	cpu = smp_processor_id();
-#endif
+	unsigned int random = 0, irq = desc->irq_data.irq;
 
 	do {
 		irqreturn_t res;
 
 		trace_irq_handler_entry(irq, action);
-#ifdef CONFIG_SAMSUNG_KERNEL_DEBUG
-#ifdef CONFIG_SAMSUNG_LOG_BUF
-		if (a_log_irq) {
-			log_idx++;
-			if ((unsigned int)log_idx >= IRQ_LOG_MAX)
-				log_idx = 0;
-
-			a_log_irq[log_idx].time = cpu_clock(cpu);
-			a_log_irq[log_idx].cpu = cpu;
-			a_log_irq[log_idx].id = irq;
-			a_log_irq[log_idx].ret = -1;
-		} else if (log_buf_irq) {
-			a_log_irq = (irq_log_t*)log_buf_irq;
-		}
-#endif
-#endif
 		res = action->handler(irq, action->dev_id);
 		trace_irq_handler_exit(irq, action, res);
-#ifdef CONFIG_SAMSUNG_KERNEL_DEBUG
-#ifdef CONFIG_SAMSUNG_LOG_BUF
-		if (a_log_irq) {
-			log_idx++;
-			if ((unsigned int)log_idx >= IRQ_LOG_MAX)
-				log_idx = 0;
-			
-			a_log_irq[log_idx].time = cpu_clock(cpu);
-			a_log_irq[log_idx].cpu = cpu;
-			a_log_irq[log_idx].id = irq;
-			a_log_irq[log_idx].ret = res;
-		}
-#endif          
-#endif
+
 		if (WARN_ONCE(!irqs_disabled(),"irq %u handler %pF enabled interrupts\n",
 			      irq, action->handler))
 			local_irq_disable();
@@ -201,7 +161,7 @@ handle_irq_event_percpu(struct irq_desc *desc, struct irqaction *action)
 
 			/* Fall through to add to randomness */
 		case IRQ_HANDLED:
-			flags |= action->flags;
+			random |= action->flags;
 			break;
 
 		default:
@@ -212,7 +172,8 @@ handle_irq_event_percpu(struct irq_desc *desc, struct irqaction *action)
 		action = action->next;
 	} while (action);
 
-	add_interrupt_randomness(irq, flags);
+	if (random & IRQF_SAMPLE_RANDOM)
+		add_interrupt_randomness(irq);
 
 	if (!noirqdebug)
 		note_interrupt(irq, desc, retval);

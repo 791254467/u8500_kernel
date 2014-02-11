@@ -109,6 +109,17 @@ struct bt_vs_bt_enable_cmd {
 	u8	enable;
 } __packed;
 
+/* Bytes in the command Hci_Cmd_ST_Set_Uart_Baud_Rate */
+#define CG2900_BAUD_RATE_57600				0x03
+#define CG2900_BAUD_RATE_115200				0x02
+#define CG2900_BAUD_RATE_230400				0x01
+#define CG2900_BAUD_RATE_460800				0x00
+#define CG2900_BAUD_RATE_921600				0x20
+#define CG2900_BAUD_RATE_2000000			0x25
+#define CG2900_BAUD_RATE_3000000			0x27
+#define CG2900_BAUD_RATE_3250000			0x28
+#define CG2900_BAUD_RATE_4000000			0x2B
+
 /* BT VS SetBaudRate command */
 #define CG2900_BT_OP_VS_SET_BAUD_RATE			0xFC09
 struct bt_vs_set_baud_rate_cmd {
@@ -508,8 +519,6 @@ union fm_leg_evt_or_irq {
 /* FM Command IDs */
 #define CG2900_FM_CMD_ID_AUP_EXT_SET_MODE		0x0162
 #define CG2900_FM_CMD_ID_AUP_EXT_SET_CTRL		0x0182
-#define CG2900_FM_CMD_ID_AUP_BT_SET_MODE		0x00C2
-#define CG2900_FM_CMD_ID_AUP_BT_SET_CTRL		0x00E2
 #define CG2900_FM_CMD_ID_AIP_SET_MODE			0x01C6
 #define CG2900_FM_CMD_ID_AIP_BT_SET_CTRL		0x01A6
 #define CG2900_FM_CMD_ID_AIP_BT_SET_MODE		0x01E6
@@ -566,11 +575,6 @@ union fm_leg_evt_or_irq {
 #define CG2900_FM_CMD_AUP_EXT_SET_MODE_DISABLED		0x0000
 #define CG2900_FM_CMD_AUP_EXT_SET_MODE_I2S		0x0001
 #define CG2900_FM_CMD_AUP_EXT_SET_MODE_PARALLEL		0x0002
-
-/* AUP_BT_SetMode Output enum */
-#define CG2900_FM_CMD_AUP_BT_SET_MODE_DISABLED		0x0000
-#define CG2900_FM_CMD_AUP_BT_SET_MODE_BYPASSED		0x0001
-#define CG2900_FM_CMD_AUP_BT_SET_MODE_PARALLEL		0x0002
 
 /* SetControl Conversion enum */
 #define CG2900_FM_CMD_SET_CTRL_CONV_UP			0x0000

@@ -637,6 +637,7 @@ void sctp_addr_wq_timeout_handler(unsigned long arg)
 		    " for cmd %d at entry %p\n", &sctp_addr_waitq, &addrw->a, addrw->state,
 		    addrw);
 
+#if IS_ENABLED(CONFIG_IPV6)
 		/* Now we send an ASCONF for each association */
 		/* Note. we currently don't handle link local IPv6 addressees */
 		if (addrw->a.sa.sa_family == AF_INET6) {
@@ -659,7 +660,7 @@ void sctp_addr_wq_timeout_handler(unsigned long arg)
 				break;
 			}
 		}
-
+#endif
 		list_for_each_entry(sp, &sctp_auto_asconf_splist, auto_asconf_list) {
 			struct sock *sk;
 
@@ -1301,7 +1302,7 @@ SCTP_STATIC __init int sctp_init(void)
 	max_share = min(4UL*1024*1024, limit);
 
 	sysctl_sctp_rmem[0] = SK_MEM_QUANTUM; /* give each asoc 1 page min */
-	sysctl_sctp_rmem[1] = (1500 *(sizeof(struct sk_buff) + 1));
+	sysctl_sctp_rmem[1] = 1500 * SKB_TRUESIZE(1);
 	sysctl_sctp_rmem[2] = max(sysctl_sctp_rmem[1], max_share);
 
 	sysctl_sctp_wmem[0] = SK_MEM_QUANTUM;

@@ -68,9 +68,7 @@
 #include <linux/shmem_fs.h>
 #include <linux/slab.h>
 #include <linux/perf_event.h>
-#include <linux/random.h>
 #include <linux/boottime.h>
-#include <linux/pasr.h>
 
 #include <asm/io.h>
 #include <asm/bugs.h>
@@ -90,7 +88,6 @@ extern void mca_init(void);
 extern void sbus_init(void);
 extern void prio_tree_init(void);
 extern void radix_tree_init(void);
-extern void free_initmem(void);
 #ifndef CONFIG_DEBUG_RODATA
 static inline void mark_rodata_ro(void) { }
 #endif
@@ -158,24 +155,6 @@ static const char *panic_later, *panic_param;
 
 extern const struct obs_kernel_param __setup_start[], __setup_end[];
 
-#ifdef CONFIG_SAMSUNG_LOG_BUF
-void __iomem * log_buf_base = NULL;
-EXPORT_SYMBOL(log_buf_base);
-
-#include <mach/board-sec-ux500.h>
-extern void* log_buf_irq;
-extern int log_buf_irq_entry_size;
-extern int log_buf_irq_entry_count;
-extern void* log_buf_sched;
-extern int log_buf_sched_entry_size;
-extern int log_buf_sched_entry_count;
-extern void* log_buf_prcmu;
-extern int log_buf_prcmu_entry_size;
-extern int log_buf_prcmu_entry_count;
-
-unsigned int * log_buf_writel = NULL;
-EXPORT_SYMBOL(log_buf_writel);
-#endif
 static int __init obsolete_checksetup(char *line)
 {
 	const struct obs_kernel_param *p;
@@ -184,7 +163,7 @@ static int __init obsolete_checksetup(char *line)
 	p = __setup_start;
 	do {
 		int n = strlen(p->str);
-		if (!strncmp(line, p->str, n)) {
+		if (parameqn(line, p->str, n)) {
 			if (p->early) {
 				/* Already done in parse_early_param?
 				 * (Needs exact match on param part).
@@ -230,19 +209,26 @@ early_param("quiet", quiet_kernel);
 
 static int __init loglevel(char *str)
 {
-	get_option(&str, &console_loglevel);
-	return 0;
+	int newlevel;
+
+	/*
+	 * Only update loglevel value when a correct setting was passed,
+	 * to prevent blind crashes (when loglevel being set to 0) that
+	 * are quite hard to debug
+	 */
+	if (get_option(&str, &newlevel)) {
+		console_loglevel = newlevel;
+		return 0;
+	}
+
+	return -EINVAL;
 }
 
 early_param("loglevel", loglevel);
 
-/*
- * Unknown boot options get handed to init, unless they look like
- * unused parameters (modprobe will find them in /proc/cmdline).
- */
-static int __init unknown_bootoption(char *param, char *val)
+/* Change NUL term back to "=", to make "param" the whole string. */
+static int __init repair_env_string(char *param, char *val)
 {
-	/* Change NUL term back to "=", to make "param" the whole string. */
 	if (val) {
 		/* param=val or param="val"? */
 		if (val == param+strlen(param)+1)
@@ -254,6 +240,16 @@ static int __init unknown_bootoption(char *param, char *val)
 		} else
 			BUG();
 	}
+	return 0;
+}
+
+/*
+ * Unknown boot options get handed to init, unless they look like
+ * unused parameters (modprobe will find them in /proc/cmdline).
+ */
+static int __init unknown_bootoption(char *param, char *val)
+{
+	repair_env_string(param, val);
 
 	/* Handle obsolete-style parameters */
 	if (obsolete_checksetup(param))
@@ -291,10 +287,6 @@ static int __init unknown_bootoption(char *param, char *val)
 	}
 	return 0;
 }
-
-#ifdef CONFIG_DEBUG_PAGEALLOC
-int __read_mostly debug_pagealloc_enabled = 0;
-#endif
 
 static int __init init_setup(char *str)
 {
@@ -388,10 +380,7 @@ static noinline void __init_refok rest_init(void)
 	 * at least once to get things moving:
 	 */
 	init_idle_bootup_task(current);
-	preempt_enable_no_resched();
-	schedule();
-	preempt_disable();
-
+	schedule_preempt_disabled();
 	/* Call into cpu_idle with preempt disabled */
 	cpu_idle();
 }
@@ -402,7 +391,7 @@ static int __init do_early_param(char *param, char *val)
 	const struct obs_kernel_param *p;
 
 	for (p = __setup_start; p < __setup_end; p++) {
-		if ((p->early && strcmp(param, p->str) == 0) ||
+		if ((p->early && parameq(param, p->str)) ||
 		    (strcmp(param, "console") == 0 &&
 		     strcmp(p->str, "earlycon") == 0)
 		) {
@@ -417,7 +406,7 @@ static int __init do_early_param(char *param, char *val)
 
 void __init parse_early_options(char *cmdline)
 {
-	parse_args("early options", cmdline, NULL, 0, do_early_param);
+	parse_args("early options", cmdline, NULL, 0, 0, 0, do_early_param);
 }
 
 /* Arch code calls this early on, or if not, just before other parsing. */
@@ -463,8 +452,8 @@ void __init __weak thread_info_cache_init(void)
 static void __init mm_init(void)
 {
 	/*
-	 * page_cgroup requires countinous pages as memmap
-	 * and it's bigger than MAX_ORDER unless SPARSEMEM.
+	 * page_cgroup requires contiguous pages,
+	 * bigger than MAX_ORDER unless SPARSEMEM.
 	 */
 	page_cgroup_init_flatmem();
 	mem_init();
@@ -479,13 +468,12 @@ asmlinkage void __init start_kernel(void)
 	char * command_line;
 	extern const struct kernel_param __start___param[], __stop___param[];
 
-	smp_setup_processor_id();
-
 	/*
 	 * Need to run as early as possible, to initialize the
 	 * lockdep hash:
 	 */
 	lockdep_init();
+	smp_setup_processor_id();
 	debug_objects_early_init();
 
 	/*
@@ -507,9 +495,6 @@ asmlinkage void __init start_kernel(void)
 	page_address_init();
 	printk(KERN_NOTICE "%s", linux_banner);
 	setup_arch(&command_line);
-#ifdef CONFIG_PASR
-	early_pasr_setup();
-#endif
 	mm_init_owner(&init_mm, &init_task);
 	mm_init_cpumask(&init_mm);
 	setup_command_line(command_line);
@@ -524,7 +509,10 @@ asmlinkage void __init start_kernel(void)
 	parse_early_param();
 	parse_args("Booting kernel", static_command_line, __start___param,
 		   __stop___param - __start___param,
-		   &unknown_bootoption);
+		   0, 0, &unknown_bootoption);
+
+	jump_label_init();
+
 	/*
 	 * These use large bootmem allocations and must precede
 	 * kmem_cache_init()
@@ -573,11 +561,10 @@ asmlinkage void __init start_kernel(void)
 	early_boot_irqs_disabled = false;
 	local_irq_enable();
 
-	kmem_cache_init_late();
+	/* Interrupts are enabled now so all GFP allocations are safe. */
+	gfp_allowed_mask = __GFP_BITS_MASK;
 
-#ifdef CONFIG_PASR
-	late_pasr_setup();
-#endif
+	kmem_cache_init_late();
 
 	/*
 	 * HACK ALERT! This is early. We're enabling the console before
@@ -608,7 +595,6 @@ asmlinkage void __init start_kernel(void)
 	}
 #endif
 	page_cgroup_init();
-	enable_debug_pagealloc();
 	debug_objects_mem_init();
 	kmemleak_init();
 	setup_per_cpu_pageset();
@@ -643,44 +629,6 @@ asmlinkage void __init start_kernel(void)
 	taskstats_init_early();
 	delayacct_init();
 
-#ifdef CONFIG_SAMSUNG_LOG_BUF
-	{
-		extern struct meminfo meminfo;
-		struct membank * bank =&meminfo.bank[meminfo.nr_banks-1];
-		log_buf_base = ioremap(bank->start + bank->size, 0x100000);
-		if(!log_buf_base)
-			printk(KERN_NOTICE "[LOG][ERROR] %s() log_buf_base = 0x%p\n", __FUNCTION__, log_buf_base);
-		else {
-			printk(KERN_NOTICE "[LOG] %s() log_buf_base = 0x%p, size=%ld\n", __FUNCTION__, 
-				(long unsigned int)log_buf_base, bank->size);
-
-			/* irq log buffer initialize */
-			if (LOG_IRQ_BUF_SIZE < (log_buf_irq_entry_size*(log_buf_irq_entry_count+2))) {
-				printk(KERN_NOTICE "LOG_IRQ_BUF_SIZE should be checked!!\n");
-			} else {
-				log_buf_irq = (void*)((unsigned long)log_buf_base + LOG_IRQ_BUF_START + log_buf_irq_entry_size);
-			}
-
-			/* scheduler log buffer initialize */
-			if (LOG_SCHED_BUF_SIZE < (log_buf_sched_entry_size*(log_buf_sched_entry_count+2))) {
-				printk(KERN_NOTICE "LOG_SCHED_BUF_SIZE should be checked!!\n");
-			} else {
-				log_buf_sched = (void*)((unsigned long)log_buf_base + LOG_SCHED_BUF_START + log_buf_sched_entry_size);
-			}
-
-			/* prcmu/shrm log buffer initialize */
-			if (LOG_SHRM_PRCMU_BUF_SIZE < (log_buf_prcmu_entry_size*(log_buf_prcmu_entry_count+2))) {
-				printk(KERN_NOTICE "LOG_SHRM_PRCMU_BUF_SIZE should be checked!!\n");
-			} else {
-				log_buf_prcmu = (void*)((unsigned long)log_buf_base + LOG_SHRM_PRCMU_BUF_START + log_buf_prcmu_entry_size);
-			}
-
-			/* writel log initialize */
-			log_buf_writel = (unsigned int*)((unsigned long)log_buf_base + 0x100000 - 4);
-		}
-	}
-#endif
-
 	check_bugs();
 
 	acpi_early_init(); /* before LAPIC and SMP init */
@@ -703,7 +651,7 @@ static void __init do_ctors(void)
 #endif
 }
 
-int initcall_debug;
+bool initcall_debug;
 core_param(initcall_debug, initcall_debug, bool, 0644);
 
 static char msgbuf[64];
@@ -759,14 +707,62 @@ int __init_or_module do_one_initcall(initcall_t fn)
 }
 
 
-extern initcall_t __initcall_start[], __initcall_end[], __early_initcall_end[];
+extern initcall_t __initcall_start[];
+extern initcall_t __initcall0_start[];
+extern initcall_t __initcall1_start[];
+extern initcall_t __initcall2_start[];
+extern initcall_t __initcall3_start[];
+extern initcall_t __initcall4_start[];
+extern initcall_t __initcall5_start[];
+extern initcall_t __initcall6_start[];
+extern initcall_t __initcall7_start[];
+extern initcall_t __initcall_end[];
+
+static initcall_t *initcall_levels[] __initdata = {
+	__initcall0_start,
+	__initcall1_start,
+	__initcall2_start,
+	__initcall3_start,
+	__initcall4_start,
+	__initcall5_start,
+	__initcall6_start,
+	__initcall7_start,
+	__initcall_end,
+};
+
+static char *initcall_level_names[] __initdata = {
+	"early parameters",
+	"core parameters",
+	"postcore parameters",
+	"arch parameters",
+	"subsys parameters",
+	"fs parameters",
+	"device parameters",
+	"late parameters",
+};
+
+static void __init do_initcall_level(int level)
+{
+	extern const struct kernel_param __start___param[], __stop___param[];
+	initcall_t *fn;
+
+	strcpy(static_command_line, saved_command_line);
+	parse_args(initcall_level_names[level],
+		   static_command_line, __start___param,
+		   __stop___param - __start___param,
+		   level, level,
+		   repair_env_string);
+
+	for (fn = initcall_levels[level]; fn < initcall_levels[level+1]; fn++)
+		do_one_initcall(*fn);
+}
 
 static void __init do_initcalls(void)
 {
-	initcall_t *fn;
+	int level;
 
-	for (fn = __early_initcall_end; fn < __initcall_end; fn++)
-		do_one_initcall(*fn);
+	for (level = 0; level < ARRAY_SIZE(initcall_levels) - 1; level++)
+		do_initcall_level(level);
 }
 
 /*
@@ -780,19 +776,19 @@ static void __init do_basic_setup(void)
 {
 	cpuset_init_smp();
 	usermodehelper_init();
-	init_tmpfs();
+	shmem_init();
 	driver_init();
 	init_irq_proc();
 	do_ctors();
+	usermodehelper_enable();
 	do_initcalls();
-	random_int_secret_init();
 }
 
 static void __init do_pre_smp_initcalls(void)
 {
 	initcall_t *fn;
 
-	for (fn = __initcall_start; fn < __early_initcall_end; fn++)
+	for (fn = __initcall_start; fn < __initcall0_start; fn++)
 		do_one_initcall(*fn);
 }
 
@@ -850,10 +846,6 @@ static int __init kernel_init(void * unused)
 	 * Wait until kthreadd is all set-up.
 	 */
 	wait_for_completion(&kthreadd_done);
-
-	/* Now the scheduler is fully set up and can do blocking allocations */
-	gfp_allowed_mask = __GFP_BITS_MASK;
-
 	/*
 	 * init can allocate pages on any node
 	 */

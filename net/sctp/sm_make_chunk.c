@@ -2773,7 +2773,7 @@ struct sctp_chunk *sctp_make_asconf_update_ip(struct sctp_association *asoc,
 	/* Get total length of all the address parameters. */
 	addr_buf = addrs;
 	for (i = 0; i < addrcnt; i++) {
-		addr = (union sctp_addr *)addr_buf;
+		addr = addr_buf;
 		af = sctp_get_af_specific(addr->v4.sin_family);
 		addr_param_len = af->to_addr_param(addr, &addr_param);
 
@@ -2798,7 +2798,7 @@ struct sctp_chunk *sctp_make_asconf_update_ip(struct sctp_association *asoc,
 	/* Add the address parameters to the asconf chunk. */
 	addr_buf = addrs;
 	for (i = 0; i < addrcnt; i++) {
-		addr = (union sctp_addr *)addr_buf;
+		addr = addr_buf;
 		af = sctp_get_af_specific(addr->v4.sin_family);
 		addr_param_len = af->to_addr_param(addr, &addr_param);
 		param.param_hdr.type = flags;
@@ -2958,8 +2958,7 @@ static __be16 sctp_process_asconf_param(struct sctp_association *asoc,
 	union sctp_addr	addr;
 	union sctp_addr_param *addr_param;
 
-	addr_param = (union sctp_addr_param *)
-			((void *)asconf_param + sizeof(sctp_addip_param_t));
+	addr_param = (void *)asconf_param + sizeof(sctp_addip_param_t);
 
 	if (asconf_param->param_hdr.type != SCTP_PARAM_ADD_IP &&
 	    asconf_param->param_hdr.type != SCTP_PARAM_DEL_IP &&
@@ -3016,6 +3015,7 @@ static __be16 sctp_process_asconf_param(struct sctp_association *asoc,
 		/* Start the heartbeat timer. */
 		if (!mod_timer(&peer->hb_timer, sctp_transport_timeout(peer)))
 			sctp_transport_hold(peer);
+		asoc->new_transport = peer;
 		break;
 	case SCTP_PARAM_DEL_IP:
 		/* ADDIP 4.3 D7) If a request is received to delete the
@@ -3033,7 +3033,7 @@ static __be16 sctp_process_asconf_param(struct sctp_association *asoc,
 		 * an Error Cause TLV set to the new error code 'Request to
 		 * Delete Source IP Address'
 		 */
-		if (sctp_cmp_addr_exact(sctp_source(asconf), &addr))
+		if (sctp_cmp_addr_exact(&asconf->source, &addr))
 			return SCTP_ERROR_DEL_SRC_IP;
 
 		/* Section 4.2.2
@@ -3144,7 +3144,7 @@ struct sctp_chunk *sctp_process_asconf(struct sctp_association *asoc,
 	 * asconf parameter.
 	 */
 	length = ntohs(addr_param->p.length);
-	asconf_param = (sctp_addip_param_t *)((void *)addr_param + length);
+	asconf_param = (void *)addr_param + length;
 	chunk_len -= length;
 
 	/* create an ASCONF_ACK chunk.
@@ -3185,8 +3185,7 @@ struct sctp_chunk *sctp_process_asconf(struct sctp_association *asoc,
 
 		/* Move to the next ASCONF param. */
 		length = ntohs(asconf_param->param_hdr.length);
-		asconf_param = (sctp_addip_param_t *)((void *)asconf_param +
-						      length);
+		asconf_param = (void *)asconf_param + length;
 		chunk_len -= length;
 	}
 
@@ -3216,8 +3215,7 @@ static void sctp_asconf_param_success(struct sctp_association *asoc,
 	struct sctp_transport *transport;
 	struct sctp_sockaddr_entry *saddr;
 
-	addr_param = (union sctp_addr_param *)
-			((void *)asconf_param + sizeof(sctp_addip_param_t));
+	addr_param = (void *)asconf_param + sizeof(sctp_addip_param_t);
 
 	/* We have checked the packet before, so we do not check again.	*/
 	af = sctp_get_af_specific(param_type2af(addr_param->p.type));
@@ -3302,8 +3300,7 @@ static __be16 sctp_get_asconf_response(struct sctp_chunk *asconf_ack,
 				return SCTP_ERROR_NO_ERROR;
 			case SCTP_PARAM_ERR_CAUSE:
 				length = sizeof(sctp_addip_param_t);
-				err_param = (sctp_errhdr_t *)
-					   ((void *)asconf_ack_param + length);
+				err_param = (void *)asconf_ack_param + length;
 				asconf_ack_len -= length;
 				if (asconf_ack_len > 0)
 					return err_param->cause;
@@ -3316,8 +3313,7 @@ static __be16 sctp_get_asconf_response(struct sctp_chunk *asconf_ack,
 		}
 
 		length = ntohs(asconf_ack_param->param_hdr.length);
-		asconf_ack_param = (sctp_addip_param_t *)
-					((void *)asconf_ack_param + length);
+		asconf_ack_param = (void *)asconf_ack_param + length;
 		asconf_ack_len -= length;
 	}
 
@@ -3349,7 +3345,7 @@ int sctp_process_asconf_ack(struct sctp_association *asoc,
 	 * pointer to the first asconf parameter.
 	 */
 	length = ntohs(addr_param->p.length);
-	asconf_param = (sctp_addip_param_t *)((void *)addr_param + length);
+	asconf_param = (void *)addr_param + length;
 	asconf_len -= length;
 
 	/* ADDIP 4.1
@@ -3400,13 +3396,14 @@ int sctp_process_asconf_ack(struct sctp_association *asoc,
 		 * one.
 		 */
 		length = ntohs(asconf_param->param_hdr.length);
-		asconf_param = (sctp_addip_param_t *)((void *)asconf_param +
-						      length);
+		asconf_param = (void *)asconf_param + length;
 		asconf_len -= length;
 	}
 
-	if (no_err && asoc->src_out_of_asoc_ok)
+	if (no_err && asoc->src_out_of_asoc_ok) {
 		asoc->src_out_of_asoc_ok = 0;
+		sctp_transport_immediate_rtx(asoc->peer.primary_path);
+	}
 
 	/* Free the cached last sent asconf chunk. */
 	list_del_init(&asconf->transmitted_list);
