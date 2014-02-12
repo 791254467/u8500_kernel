@@ -265,6 +265,8 @@ static inline void suspend_thaw_processes(void)
 }
 #endif
 
+extern struct wake_lock main_wake_lock;
+
 #ifdef CONFIG_USER_WAKELOCK
 ssize_t wake_lock_show(struct kobject *kobj, struct kobj_attribute *attr,
 			char *buf);

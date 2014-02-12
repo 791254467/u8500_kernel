@@ -21,10 +21,13 @@
 #include <linux/clk.h>
 #include <linux/io.h>
 #include <linux/workqueue.h>
-#include <linux/wakelock.h>
 #include <linux/version.h>
 
-#if LINUX_VERSION_CODE < KERNEL_VERSION(3,0,0)
+#if CONFIG_HAS_WAKELOCK
+#include <linux/wakelock.h>
+#endif
+
+#if LINUX_VERSION_CODE < KERNEL_VERSION(3, 0, 0)
 #include <mach/prcmu.h>
 #else
 #include <linux/mfd/dbx500-prcmu.h>
@@ -33,6 +36,9 @@
 #define MALI_HIGH_TO_LOW_LEVEL_UTILIZATION_LIMIT 64
 #define MALI_LOW_TO_HIGH_LEVEL_UTILIZATION_LIMIT 192
 
+unsigned int mali_utilization_high_to_low = MALI_HIGH_TO_LOW_LEVEL_UTILIZATION_LIMIT;
+unsigned int mali_utilization_low_to_high = MALI_LOW_TO_HIGH_LEVEL_UTILIZATION_LIMIT;
+
 static bool is_running;
 static bool is_initialized;
 static struct regulator *regulator;
@@ -40,12 +46,18 @@ static struct clk *clk_sga;
 static u32 last_utilization;
 static struct work_struct mali_utilization_work;
 static struct workqueue_struct *mali_utilization_workqueue;
-static struct wake_lock wakelock;
 
-static _mali_osk_errcode_t mali_platform_powerdown()
+#if CONFIG_HAS_WAKELOCK
+static struct wake_lock wakelock;
+#endif
+
+static _mali_osk_errcode_t mali_platform_powerdown(void)
 {
 	if (is_running) {
+
+#if CONFIG_HAS_WAKELOCK
 		wake_unlock(&wakelock);
+#endif
 		clk_disable(clk_sga);
 		if (regulator) {
 			int ret = regulator_disable(regulator);
@@ -61,7 +73,7 @@ static _mali_osk_errcode_t mali_platform_powerdown()
 	MALI_SUCCESS;
 }
 
-static _mali_osk_errcode_t mali_platform_powerup()
+static _mali_osk_errcode_t mali_platform_powerup(void)
 {
 	if (!is_running) {
 		int ret = regulator_enable(regulator);
@@ -77,7 +89,9 @@ static _mali_osk_errcode_t mali_platform_powerup()
 			goto error;
 		}
 
+#if CONFIG_HAS_WAKELOCK
 		wake_lock(&wakelock);
+#endif
 		is_running = true;
 	}
 	MALI_DEBUG_PRINT(4, ("mali_platform_powerup is_running:%u\n", is_running));
@@ -112,7 +126,7 @@ void mali_utilization_function(struct work_struct *ptr)
 	/*By default, platform start with 50% APE OPP and 25% DDR OPP*/
 	static u32 has_requested_low = 1;
 
-	if (last_utilization > MALI_LOW_TO_HIGH_LEVEL_UTILIZATION_LIMIT) {
+	if (last_utilization > mali_utilization_low_to_high) {
 		if (has_requested_low) {
 			MALI_DEBUG_PRINT(5, ("MALI GPU utilization: %u SIGNAL_HIGH\n", last_utilization));
 			/*Request 100% APE_OPP.*/
@@ -131,7 +145,7 @@ void mali_utilization_function(struct work_struct *ptr)
 			has_requested_low = 0;
 		}
 	} else {
-		if (last_utilization < MALI_HIGH_TO_LOW_LEVEL_UTILIZATION_LIMIT) {
+		if (last_utilization < mali_utilization_high_to_low) {
 			if (!has_requested_low) {
 				/*Remove APE_OPP and DDR_OPP requests*/
 				prcmu_qos_remove_requirement(PRCMU_QOS_APE_OPP, "mali");
@@ -149,7 +163,7 @@ _mali_osk_errcode_t mali_platform_init()
 	is_running = false;
 	last_utilization = 0;
 
-	if(!is_initialized) {
+	if (!is_initialized) {
 
 		mali_utilization_workqueue = create_singlethread_workqueue("mali_utilization_workqueue");
 		if (NULL == mali_utilization_workqueue) {
@@ -171,7 +185,9 @@ _mali_osk_errcode_t mali_platform_init()
 			goto error;
 		}
 
+#if CONFIG_HAS_WAKELOCK
 		wake_lock_init(&wakelock, WAKE_LOCK_SUSPEND, "mali_wakelock");
+#endif
 		is_initialized = true;
 	}
 
@@ -186,7 +202,10 @@ _mali_osk_errcode_t mali_platform_deinit()
 	destroy_workqueue(mali_utilization_workqueue);
 	regulator_put(regulator);
 	clk_put(clk_sga);
+
+#if CONFIG_HAS_WAKELOCK
 	wake_lock_destroy(&wakelock);
+#endif
 	is_running = false;
 	last_utilization = 0;
 	is_initialized = false;
@@ -196,11 +215,11 @@ _mali_osk_errcode_t mali_platform_deinit()
 
 _mali_osk_errcode_t mali_platform_power_mode_change(mali_power_mode power_mode)
 {
-  if (MALI_POWER_MODE_ON == power_mode) {
-    return mali_platform_powerup();
-  }
-  /*We currently don't make any distinction between MALI_POWER_MODE_LIGHT_SLEEP and MALI_POWER_MODE_DEEP_SLEEP*/
-  return mali_platform_powerdown();
+	if (MALI_POWER_MODE_ON == power_mode)
+		return mali_platform_powerup();
+
+	/*We currently don't make any distinction between MALI_POWER_MODE_LIGHT_SLEEP and MALI_POWER_MODE_DEEP_SLEEP*/
+	return mali_platform_powerdown();
 }
 
 void mali_gpu_utilization_handler(u32 utilization)
@@ -217,7 +236,7 @@ void mali_gpu_utilization_handler(u32 utilization)
 	queue_work(mali_utilization_workqueue, &mali_utilization_work);
 }
 
-void set_mali_parent_power_domain(void* dev)
+void set_mali_parent_power_domain(void *dev)
 {
-  MALI_DEBUG_PRINT(1, ("This function should not be called since we are not using run time pm\n"));
+	MALI_DEBUG_PRINT(2, ("This function should not be called since we are not using run time pm\n"));
 }

@@ -37,7 +37,8 @@ enum clonedev_mode {
 	CLONEDEV_CLONE_UI,
 };
 
-#define CLONEDEV_SET_MODE_IOC      _IOW('D', 1, __u32*)
+#define CLONEDEV_SET_MODE_IOC       _IOW('D', 1, __u32*)
+#define CLONEDEV_SET_CROP_RATIO_IOC _IOW('D', 2, __u32*)
 
 #ifdef __KERNEL__
 
@@ -47,4 +48,3 @@ void clonedev_destroy(void);
 #endif /* __KERNEL__ */
 
 #endif /* _CLONEDEV_H_ */
-
